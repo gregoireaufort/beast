@@ -289,10 +289,24 @@ def fit_submodel(
             grid_info_dict = pickle.loads(p.read())
     else:
         subgrid_run = False
+        grid_info_dict = None
 
     # load the SED grid and noise model
     modelsedgrid = SEDGrid(modelsedgrid_file)
     noisemodel_vals = noisemodel.get_noisemodelcat(noise_file)
+
+    # optional fitting settings for batched / top-k path
+    # defaults preserve the original BEAST behavior
+    fit_use_batched = getattr(settings, "fit_use_batched", False)
+    fit_use_topk = getattr(settings, "fit_use_topk", False)
+
+    fit_star_batch_size = getattr(settings, "fit_star_batch_size", 512)
+
+    fit_topk_mass_target = getattr(settings, "fit_topk_mass_target", 0.999)
+    fit_topk_ess_target = getattr(settings, "fit_topk_ess_target", 128.0)
+    fit_topk_kmin = getattr(settings, "fit_topk_kmin", 32)
+    fit_topk_kmax = getattr(settings, "fit_topk_kmax", 2048)
+    fit_topk_kquantile = getattr(settings, "fit_topk_kquantile", 0.95)
 
     if subgrid_run:
         fit.summary_table_memory(
@@ -312,6 +326,14 @@ def fit_submodel(
             lnp_outname=lnp_file,
             do_not_normalize=True,
             surveyname=settings.surveyname,
+            fit_use_batched=fit_use_batched,
+            fit_use_topk=fit_use_topk,
+            fit_star_batch_size=fit_star_batch_size,
+            fit_topk_mass_target=fit_topk_mass_target,
+            fit_topk_ess_target=fit_topk_ess_target,
+            fit_topk_kmin=fit_topk_kmin,
+            fit_topk_kmax=fit_topk_kmax,
+            fit_topk_kquantile=fit_topk_kquantile,
         )
         print("Done fitting on grid " + modelsedgrid_file)
 
@@ -332,6 +354,14 @@ def fit_submodel(
             pdf2d_param_list=pdf2d_param_list,
             lnp_outname=lnp_file,
             surveyname=settings.surveyname,
+            fit_use_batched=fit_use_batched,
+            fit_use_topk=fit_use_topk,
+            fit_star_batch_size=fit_star_batch_size,
+            fit_topk_mass_target=fit_topk_mass_target,
+            fit_topk_ess_target=fit_topk_ess_target,
+            fit_topk_kmin=fit_topk_kmin,
+            fit_topk_kmax=fit_topk_kmax,
+            fit_topk_kquantile=fit_topk_kquantile,
         )
         print("Done fitting on grid " + modelsedgrid_file)
 

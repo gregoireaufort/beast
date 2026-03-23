@@ -310,6 +310,514 @@ def setup_param_bins(qname, max_nbins, g0, full_model_flux, filters, grid_info_d
     return qname_vals, nbins, logspacing, minval, maxval, uniqvals
 
 
+def _batch_hist1d(bin_idx, W, nbins):
+    # dense: bin_idx (M,), W (B,M)
+    B, M = W.shape
+    rows = np.repeat(np.arange(B, dtype=np.int64), M)
+    comp = rows * nbins + np.tile(bin_idx.astype(np.int64), B)
+    out = np.bincount(comp, weights=W.ravel(), minlength=B * nbins)
+    return out.reshape(B, nbins)
+
+
+def _batch_hist1d_topk(bin_idx_2d, W, nbins):
+    # topk: bin_idx_2d (B,K), W (B,K)
+    B, K = W.shape
+    rows = np.repeat(np.arange(B, dtype=np.int64), K)
+    comp = rows * nbins + bin_idx_2d.astype(np.int64).ravel()
+    out = np.bincount(comp, weights=W.ravel(), minlength=B * nbins)
+    return out.reshape(B, nbins)
+
+
+def _batch_hist2d(bin_idx2d, W, nbins2d):
+    # dense: bin_idx2d (M,), W (B,M)
+    B, M = W.shape
+    rows = np.repeat(np.arange(B, dtype=np.int64), M)
+    comp = rows * nbins2d + np.tile(bin_idx2d.astype(np.int64), B)
+    out = np.bincount(comp, weights=W.ravel(), minlength=B * nbins2d)
+    return out.reshape(B, nbins2d)
+
+
+def _batch_hist2d_topk(bin_idx2d_2d, W, nbins2d):
+    # topk: bin_idx2d_2d (B,K), W (B,K)
+    B, K = W.shape
+    rows = np.repeat(np.arange(B, dtype=np.int64), K)
+    comp = rows * nbins2d + bin_idx2d_2d.astype(np.int64).ravel()
+    out = np.bincount(comp, weights=W.ravel(), minlength=B * nbins2d)
+    return out.reshape(B, nbins2d)
+
+
+def _cdf_quantiles_from_pdf(pdf_vals, bin_vals, pcts):
+    p = np.asarray(pcts, dtype=np.float64) / 100.0
+    B, nbins = pdf_vals.shape
+    out = np.zeros((B, len(p)), dtype=np.float64)
+
+    cdf = np.cumsum(pdf_vals, axis=1)
+    tot = cdf[:, -1]
+    valid = tot > 0
+    if not np.any(valid):
+        return out
+
+    cdfv = cdf[valid] / tot[valid, None]
+
+    for j, q in enumerate(p):
+        idx = np.argmax(cdfv >= q, axis=1)
+        idx0 = np.maximum(idx - 1, 0)
+
+        x0 = bin_vals[idx0]
+        x1 = bin_vals[idx]
+        y0 = cdfv[np.arange(cdfv.shape[0]), idx0]
+        y1 = cdfv[np.arange(cdfv.shape[0]), idx]
+
+        denom = np.where(np.abs(y1 - y0) > 0, y1 - y0, 1.0)
+        t = np.clip((q - y0) / denom, 0.0, 1.0)
+        out[valid, j] = x0 + t * (x1 - x0)
+
+    return out
+
+
+# ============================================================
+# Top-K selection from retained mass + ESS(K)
+# ============================================================
+
+def _choose_topk_from_weights(
+    W,
+    mass_target=0.999,
+    ess_target=128.0,
+    k_min=32,
+    k_max=2048,
+    quantile=0.95,
+    return_diagnostics=False,
+):
+    """
+    W: (B, M) normalized weights
+
+    ESS(K) = (sum_{i<=K} w_i)^2 / sum_{i<=K} w_i^2, with weights sorted descending.
+
+    Returns
+    -------
+    order   : (B,M) descending sort indices
+    K_star  : (B,) per-star chosen K
+    K_batch : int batch-wide K used for vectorization
+    and optionally W_sorted, rho_curve, ess_curve
+    """
+    B, M = W.shape
+
+    order = np.argsort(-W, axis=1)
+    W_sorted = np.take_along_axis(W, order, axis=1)
+
+    rho_curve = np.cumsum(W_sorted, axis=1)
+    s2_curve = np.cumsum(W_sorted * W_sorted, axis=1)
+    ess_curve = np.divide(rho_curve * rho_curve, s2_curve, out=np.zeros_like(rho_curve), where=s2_curve > 0)
+
+    Kgrid = np.arange(1, M + 1)[None, :]
+    ok = (rho_curve >= mass_target) & (ess_curve >= ess_target) & (Kgrid >= k_min)
+
+    if k_max is not None:
+        ok &= (Kgrid <= min(k_max, M))
+
+    has_ok = ok.any(axis=1)
+    fallback = min(k_max if k_max is not None else M, M)
+    K_star = np.where(has_ok, ok.argmax(axis=1) + 1, fallback)
+
+    K_batch = int(np.quantile(K_star, quantile))
+    K_batch = max(k_min, K_batch)
+    if k_max is not None:
+        K_batch = min(K_batch, k_max)
+    K_batch = min(K_batch, M)
+
+    if return_diagnostics:
+        return order, K_star, K_batch, W_sorted, rho_curve, ess_curve
+    return order, K_star, K_batch
+import numpy as np
+from itertools import combinations
+from tqdm import tqdm
+
+
+def _batched_diag_loglike(Y, mu, ivar):
+    """
+    Batched version of N_logLikelihood_NM for the no-mask case.
+
+    Parameters
+    ----------
+    Y : (B, F)
+        observed SEDs
+    mu : (M, F)
+        model_seds_with_bias
+    ivar : (M, F)
+        ast_ivar
+
+    Returns
+    -------
+    lnP : (B, M)
+    chi2 : (B, M)
+    """
+    Y = np.asarray(Y, dtype=np.float64, order="C")
+    mu = np.asarray(mu, dtype=np.float64, order="C")
+    ivar = np.asarray(ivar, dtype=np.float64, order="C")
+
+    temp = 0.5 * np.log(2.0 * np.pi)
+    n = Y.shape[1]
+    lnQ = n * temp - 0.5 * np.sum(np.log(ivar), axis=1)  # (M,)
+
+    A = ivar * mu
+    c = np.einsum("mf,mf->m", A, mu, optimize=True)
+
+    chi2 = (Y * Y) @ ivar.T
+    chi2 -= 2.0 * (Y @ A.T)
+    chi2 += c[None, :]
+
+    lnP = -lnQ[None, :] - 0.5 * chi2
+    return lnP, chi2
+
+
+def _batched_fullcov_loglike(Y, mu, q_norm, icov_diag, two_icov_offdiag):
+    """
+    Batched version of N_covar_logLikelihood.
+
+    Parameters
+    ----------
+    Y : (B, F)
+        observed SEDs
+    mu : (M, F)
+        model_seds_with_bias
+    q_norm : (M,)
+        ast_q_norm
+    icov_diag : (M, F)
+        ast_icov_diag
+    two_icov_offdiag : (M, K)
+        two_ast_icov_offdiag, with K = F*(F-1)/2
+
+    Returns
+    -------
+    lnP : (B, M)
+    chi2 : (B, M)
+    """
+    Y = np.asarray(Y, dtype=np.float64, order="C")
+    mu = np.asarray(mu, dtype=np.float64, order="C")
+    q_norm = np.asarray(q_norm, dtype=np.float64, order="C")
+    icov_diag = np.asarray(icov_diag, dtype=np.float64, order="C")
+    two_icov_offdiag = np.asarray(two_icov_offdiag, dtype=np.float64, order="C")
+
+    M, F = icov_diag.shape
+    A = np.zeros((M, F, F), dtype=np.float64)
+
+    for i in range(F):
+        A[:, i, i] = icov_diag[:, i]
+
+    k = 0
+    for i in range(F):
+        for j in range(i + 1, F):
+            off = 0.5 * two_icov_offdiag[:, k]
+            A[:, i, j] = off
+            A[:, j, i] = off
+            k += 1
+
+    b = np.einsum("mfg,mg->mf", A, mu, optimize=True)
+    c = np.einsum("mf,mf->m", mu, b, optimize=True)
+
+    quad = np.einsum("bf,mfg,bg->bm", Y, A, Y, optimize=True)
+    cross = np.einsum("bf,mf->bm", Y, b, optimize=True)
+
+    chi2 = quad - 2.0 * cross + c[None, :]
+    lnP = q_norm[None, :] - 0.5 * chi2
+    return lnP, chi2
+
+
+def Q_all_memory_batched(
+    prev_result,
+    obs,
+    sedgrid,
+    obsmodel,
+    qnames_in,
+    p=(16.0, 50.0, 84.0),
+    resume=False,
+    threshold=-40.0,
+    save_every_npts=None,
+    lnp_npts=None,
+    max_nbins=200,
+    stats_outname=None,
+    pdf1d_outname=None,
+    pdf2d_outname=None,
+    pdf2d_param_list=None,
+    grid_info_dict=None,
+    lnp_outname=None,
+    use_full_cov_matrix=False,
+    do_not_normalize=False,
+    fit_use_topk=False,
+    fit_star_batch_size=512,
+    fit_topk_mass_target=0.999,
+    fit_topk_ess_target=128.0,
+    fit_topk_kmin=32,
+    fit_topk_kmax=2048,
+    fit_topk_kquantile=0.95,
+):
+    if resume:
+        raise NotImplementedError("resume=True not implemented in Q_all_memory_batched.")
+
+    filters = obs.getFilters()
+    Y_all = np.vstack([obj for _, obj in obs.enumobs()])   # (N, F)
+    n_obs, n_filters = Y_all.shape
+
+    model_seds = _as_model_filter(sedgrid.seds, n_filters)
+    bias = _as_model_filter(obsmodel["bias"], n_filters)
+    model_seds_with_bias = model_seds + bias
+
+    g0_w = np.asarray(sedgrid["weight"])
+    g0_indxs = np.where(g0_w > 0.0)[0]
+    g0_weights = np.log(g0_w[g0_indxs])
+    if not do_not_normalize:
+        g0_weights -= np.max(g0_weights)
+
+    mu = model_seds_with_bias[g0_indxs]
+    qnames = list(qnames_in)
+    nq = len(qnames)
+
+    full_model_flux = np.asarray(sedgrid.seds)
+    g0_specgrid_indx = np.asarray(sedgrid["specgrid_indx"])
+
+    if use_full_cov_matrix:
+        ast_q_norm = np.asarray(obsmodel["q_norm"])[g0_indxs]
+        ast_icov_diag = _as_model_filter(obsmodel["icov_diag"], n_filters)[g0_indxs]
+        two_ast_icov_offdiag = np.asarray(obsmodel["two_icov_offdiag"])[g0_indxs]
+    else:
+        ast_ivar = _as_model_filter(obsmodel["error"], n_filters)[g0_indxs]
+        ast_ivar = 1.0 / np.maximum(ast_ivar, np.finfo(np.float64).tiny) ** 2
+
+    best_vals = np.zeros((n_obs, nq), dtype=np.float64)
+    exp_vals = np.zeros((n_obs, nq), dtype=np.float64)
+    per_vals = np.zeros((n_obs, nq, len(p)), dtype=np.float64)
+
+    chi2_vals = np.zeros(n_obs, dtype=np.float64)
+    chi2_indx = np.zeros(n_obs, dtype=np.int64)
+    lnp_vals = np.zeros(n_obs, dtype=np.float64)
+    lnp_indx = np.zeros(n_obs, dtype=np.int64)
+    best_specgrid_indx = np.zeros(n_obs, dtype=np.int64)
+    total_log_norm = np.zeros(n_obs, dtype=np.float64)
+
+    save_lnp_vals = []
+
+    q_arrays_full = []
+    q_arrays_active = []
+    for qname in qnames:
+        if "_bias" in qname:
+            fname = (qname.replace("_wd_bias", "")).replace("symlog", "")
+            q_full = np.asarray(full_model_flux[:, filters.index(fname)])
+        else:
+            q_full = np.asarray(sedgrid[qname])
+        q_arrays_full.append(q_full)
+        q_arrays_active.append(q_full[g0_indxs])
+
+    pdf1d_infos = []
+    save_pdf1d_vals = []
+    for qname in qnames:
+        qvals, nbins, logspacing, minval, maxval, uniqvals = setup_param_bins(
+            qname, max_nbins, sedgrid, full_model_flux, filters, grid_info_dict
+        )
+
+        if uniqvals is not None:
+            bin_vals = np.asarray(uniqvals, dtype=np.float64)
+        else:
+            bin_vals = (
+                np.logspace(np.log10(minval), np.log10(maxval), nbins)
+                if logspacing else
+                np.linspace(minval, maxval, nbins)
+            )
+
+        q_active = q_arrays_active[qnames.index(qname)]
+        idx = np.searchsorted(bin_vals, q_active, side="left")
+        idx = np.clip(idx, 0, len(bin_vals) - 1)
+
+        pdf1d_infos.append((bin_vals, idx, len(bin_vals)))
+        arr = np.zeros((n_obs + 2, len(bin_vals)), dtype=np.float32)
+        arr[-1, :] = bin_vals.astype(np.float32)
+        save_pdf1d_vals.append(arr)
+
+    if pdf2d_param_list is None:
+        pdf2d_qname_pairs = []
+    else:
+        pdf2d_qname_pairs = [f"{a}+{b}" for a, b in combinations(pdf2d_param_list, 2)]
+
+    pdf2d_infos = []
+    save_pdf2d_vals = []
+    for pair in pdf2d_qname_pairs:
+        q1name, q2name = pair.split("+")
+
+        q1vals, nb1, lg1, mn1, mx1, uq1 = setup_param_bins(
+            q1name, max_nbins, sedgrid, full_model_flux, filters, grid_info_dict
+        )
+        q2vals, nb2, lg2, mn2, mx2, uq2 = setup_param_bins(
+            q2name, max_nbins, sedgrid, full_model_flux, filters, grid_info_dict
+        )
+
+        bin1 = np.asarray(uq1, dtype=np.float64) if uq1 is not None else (
+            np.logspace(np.log10(mn1), np.log10(mx1), nb1) if lg1 else np.linspace(mn1, mx1, nb1)
+        )
+        bin2 = np.asarray(uq2, dtype=np.float64) if uq2 is not None else (
+            np.logspace(np.log10(mn2), np.log10(mx2), nb2) if lg2 else np.linspace(mn2, mx2, nb2)
+        )
+
+        q1_full = q_arrays_full[qnames.index(q1name)] if q1name in qnames else np.asarray(sedgrid[q1name])
+        q2_full = q_arrays_full[qnames.index(q2name)] if q2name in qnames else np.asarray(sedgrid[q2name])
+
+        q1_active = q1_full[g0_indxs]
+        q2_active = q2_full[g0_indxs]
+
+        idx1 = np.searchsorted(bin1, q1_active, side="left")
+        idx1 = np.clip(idx1, 0, len(bin1) - 1)
+        idx2 = np.searchsorted(bin2, q2_active, side="left")
+        idx2 = np.clip(idx2, 0, len(bin2) - 1)
+
+        flat_idx = idx1 * len(bin2) + idx2
+        pdf2d_infos.append((bin1, bin2, flat_idx, len(bin1), len(bin2)))
+
+        arr = np.zeros((n_obs + 2, len(bin1), len(bin2)), dtype=np.float32)
+        arr[-2, :, :] = np.tile(bin1[:, None], (1, len(bin2))).astype(np.float32)
+        arr[-1, :, :] = np.tile(bin2[None, :], (len(bin1), 1)).astype(np.float32)
+        save_pdf2d_vals.append(arr)
+
+    it = range(0, n_obs, fit_star_batch_size)
+    for b0 in tqdm(it, total=int(np.ceil(n_obs / fit_star_batch_size)), desc="Batched Lnp/Stats"):
+        b1 = min(n_obs, b0 + fit_star_batch_size)
+        Y = Y_all[b0:b1]
+        B = Y.shape[0]
+
+        if use_full_cov_matrix:
+            lnp0, chi20 = _batched_fullcov_loglike(
+                Y,
+                mu,
+                ast_q_norm,
+                ast_icov_diag,
+                two_ast_icov_offdiag,
+            )
+        else:
+            lnp0, chi20 = _batched_diag_loglike(
+                Y,
+                mu,
+                ast_ivar,
+            )
+
+        lnp = lnp0 + g0_weights[None, :]
+
+        max_lnp = np.max(np.where(np.isfinite(lnp), lnp, -np.inf), axis=1)
+        keep = (lnp - max_lnp[:, None]) > threshold
+
+        logw = lnp - max_lnp[:, None]
+        logw = np.where(keep, logw, -np.inf)
+        w = np.exp(np.clip(logw, -700.0, 0.0))
+        sumw = np.sum(w, axis=1, keepdims=True)
+        W = np.divide(w, sumw, out=np.zeros_like(w), where=sumw > 0)
+
+        best_local = np.argmax(lnp, axis=1)
+        best_full = g0_indxs[best_local]
+        chi2_local = np.argmin(chi20, axis=1)
+        chi2_full = g0_indxs[chi2_local]
+
+        total_log_norm[b0:b1] = max_lnp + np.log(sumw[:, 0])
+        best_specgrid_indx[b0:b1] = g0_specgrid_indx[best_full]
+        chi2_vals[b0:b1] = chi20[np.arange(B), chi2_local]
+        chi2_indx[b0:b1] = chi2_full
+        lnp_vals[b0:b1] = max_lnp
+        lnp_indx[b0:b1] = best_full
+
+        if fit_use_topk:
+            order, K_star, K_batch, _, _, _ = _choose_topk_from_weights(
+                W,
+                mass_target=fit_topk_mass_target,
+                ess_target=fit_topk_ess_target,
+                k_min=fit_topk_kmin,
+                k_max=fit_topk_kmax,
+                quantile=fit_topk_kquantile,
+                return_diagnostics=True,
+            )
+            idx_use = order[:, :K_batch]
+            W_use = np.take_along_axis(W, idx_use, axis=1)
+            W_use /= np.maximum(W_use.sum(axis=1, keepdims=True), np.finfo(np.float64).tiny)
+        else:
+            idx_use = None
+            W_use = W
+
+        for k in range(nq):
+            q_full = q_arrays_full[k]
+            q_act = q_arrays_active[k]
+            best_vals[b0:b1, k] = q_full[best_full]
+
+            if fit_use_topk:
+                q_use = q_act[idx_use]
+                exp_vals[b0:b1, k] = np.sum(W_use * q_use, axis=1)
+            else:
+                exp_vals[b0:b1, k] = W_use @ q_act
+
+        for k in range(nq):
+            bin_vals, bin_idx, nb = pdf1d_infos[k]
+            if fit_use_topk:
+                bin_top = bin_idx[idx_use]
+                pdf_batch = _batch_hist1d_topk(bin_top, W_use, nb)
+            else:
+                pdf_batch = _batch_hist1d(bin_idx, W_use, nb)
+
+            save_pdf1d_vals[k][b0:b1, :] = pdf_batch.astype(np.float32)
+            per_vals[b0:b1, k, :] = _cdf_quantiles_from_pdf(pdf_batch, bin_vals, p)
+
+        for k, info in enumerate(pdf2d_infos):
+            bin1, bin2, flat_idx, nb1, nb2 = info
+            if fit_use_topk:
+                flat_top = flat_idx[idx_use]
+                hist_flat = _batch_hist2d_topk(flat_top, W_use, nb1 * nb2)
+            else:
+                hist_flat = _batch_hist2d(flat_idx, W_use, nb1 * nb2)
+
+            save_pdf2d_vals[k][b0:b1, :, :] = hist_flat.reshape(B, nb1, nb2).astype(np.float32)
+
+        if lnp_outname is not None:
+            for bi in range(B):
+                if fit_use_topk:
+                    idx = idx_use[bi]
+                else:
+                    idx = np.where(keep[bi])[0]
+
+                if lnp_npts is not None and lnp_npts < len(idx):
+                    idx = idx[:lnp_npts]
+
+                e = b0 + bi
+                save_lnp_vals.append([
+                    e,
+                    np.array(g0_indxs[idx], dtype=np.int64),
+                    np.array(lnp[bi, idx], dtype=np.float32),
+                    np.array(chi20[bi, idx], dtype=np.float32),
+                    np.array([Y[bi]]).T,
+                ])
+
+    if pdf1d_outname is not None:
+        save_pdf1d(pdf1d_outname, save_pdf1d_vals, qnames)
+
+    if pdf2d_outname is not None and len(pdf2d_qname_pairs) > 0:
+        save_pdf2d(pdf2d_outname, save_pdf2d_vals, pdf2d_qname_pairs)
+
+    if stats_outname is not None:
+        save_stats(
+            stats_outname,
+            prev_result,
+            best_vals,
+            exp_vals,
+            per_vals,
+            chi2_vals,
+            chi2_indx,
+            lnp_vals,
+            lnp_indx,
+            best_specgrid_indx,
+            total_log_norm,
+            qnames,
+            p,
+            sedgrid.filters,
+            sedgrid.lamb,
+        )
+
+    if lnp_outname is not None:
+        save_lnp(lnp_outname, save_lnp_vals)
+
+    return None
+
+
 def Q_all_memory(
     prev_result,
     obs,
@@ -920,8 +1428,8 @@ def summary_table_memory(
     noisemodel,
     sedgrid,
     keys=None,
-    gridbackend="memory",
-    threshold=-10,
+    gridbackend="cache",
+    threshold=-40.0,
     save_every_npts=None,
     lnp_npts=None,
     resume=False,
@@ -933,9 +1441,17 @@ def summary_table_memory(
     grid_info_dict=None,
     lnp_outname=None,
     use_full_cov_matrix=True,
-    surveyname="PHAT",
+    surveyname=None,
     extraInfo=False,
     do_not_normalize=False,
+    fit_use_batched=False,
+    fit_use_topk=False,
+    fit_star_batch_size=512,
+    fit_topk_mass_target=0.999,
+    fit_topk_ess_target=128.0,
+    fit_topk_kmin=32,
+    fit_topk_kmax=2048,
+    fit_topk_kquantile=0.95,
 ):
     """
     Do the fitting in memory
@@ -1021,24 +1537,57 @@ def summary_table_memory(
     # generate an IAU complient name for each source and add other inform
     res = IAU_names_and_extra_info(obs, surveyname=surveyname, extraInfo=False)
 
-    Q_all_memory(
-        res,
-        obs,
-        g0,
-        noisemodel,
-        keys,
-        p=[16.0, 50.0, 84.0],
-        resume=resume,
-        threshold=threshold,
-        save_every_npts=save_every_npts,
-        lnp_npts=lnp_npts,
-        max_nbins=max_nbins,
-        stats_outname=stats_outname,
-        pdf1d_outname=pdf1d_outname,
-        pdf2d_outname=pdf2d_outname,
-        pdf2d_param_list=pdf2d_param_list,
-        grid_info_dict=grid_info_dict,
-        lnp_outname=lnp_outname,
-        use_full_cov_matrix=use_full_cov_matrix,
-        do_not_normalize=do_not_normalize,
-    )
+    # --------------------------------------------
+    # choose fitting core
+    # --------------------------------------------
+    if fit_use_batched:
+        Q_all_memory_batched(
+            res,
+            obs,
+            g0,
+            noisemodel,
+            keys,
+            p=[16.0, 50.0, 84.0],
+            resume=resume,
+            threshold=threshold,
+            save_every_npts=save_every_npts,
+            lnp_npts=lnp_npts,
+            max_nbins=max_nbins,
+            stats_outname=stats_outname,
+            pdf1d_outname=pdf1d_outname,
+            pdf2d_outname=pdf2d_outname,
+            pdf2d_param_list=pdf2d_param_list,
+            grid_info_dict=grid_info_dict,
+            lnp_outname=lnp_outname,
+            use_full_cov_matrix=use_full_cov_matrix,
+            do_not_normalize=do_not_normalize,
+            fit_use_topk=fit_use_topk,
+            fit_star_batch_size=fit_star_batch_size,
+            fit_topk_mass_target=fit_topk_mass_target,
+            fit_topk_ess_target=fit_topk_ess_target,
+            fit_topk_kmin=fit_topk_kmin,
+            fit_topk_kmax=fit_topk_kmax,
+            fit_topk_kquantile=fit_topk_kquantile,
+        )
+    else:
+        Q_all_memory(
+            res,
+            obs,
+            g0,
+            noisemodel,
+            keys,
+            p=[16.0, 50.0, 84.0],
+            resume=resume,
+            threshold=threshold,
+            save_every_npts=save_every_npts,
+            lnp_npts=lnp_npts,
+            max_nbins=max_nbins,
+            stats_outname=stats_outname,
+            pdf1d_outname=pdf1d_outname,
+            pdf2d_outname=pdf2d_outname,
+            pdf2d_param_list=pdf2d_param_list,
+            grid_info_dict=grid_info_dict,
+            lnp_outname=lnp_outname,
+            use_full_cov_matrix=use_full_cov_matrix,
+            do_not_normalize=do_not_normalize,
+        )
