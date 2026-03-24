@@ -9,6 +9,7 @@ from itertools import islice
 import warnings
 
 import numexpr
+from itertools import combinations
 
 from astropy import units as ap_units
 from astropy.coordinates import SkyCoord as ap_SkyCoord
@@ -437,9 +438,6 @@ def _choose_topk_from_weights(
     if return_diagnostics:
         return order, K_star, K_batch, W_sorted, rho_curve, ess_curve
     return order, K_star, K_batch
-import numpy as np
-from itertools import combinations
-from tqdm import tqdm
 
 
 def _batched_diag_loglike(Y, mu, ivar):
