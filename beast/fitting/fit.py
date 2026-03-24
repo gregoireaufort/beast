@@ -374,6 +374,15 @@ def _cdf_quantiles_from_pdf(pdf_vals, bin_vals, pcts):
 
     return out
 
+def _as_model_filter(a, n_filters):
+    a = np.asarray(a)
+    if a.ndim != 2:
+        raise ValueError(f"Expected 2D array, got {a.shape}")
+    if a.shape[1] == n_filters:
+        return a
+    if a.shape[0] == n_filters:
+        return a.T
+    raise ValueError(f"Cannot infer (M,F) layout from shape {a.shape} and n_filters={n_filters}")
 
 # ============================================================
 # Top-K selection from retained mass + ESS(K)
@@ -575,13 +584,25 @@ def Q_all_memory_batched(
     full_model_flux = np.asarray(sedgrid.seds)
     g0_specgrid_indx = np.asarray(sedgrid["specgrid_indx"])
 
-    if use_full_cov_matrix:
+    full_cov_mat = False
+    if (
+        use_full_cov_matrix
+        and ("q_norm" in obsmodel.keys())
+        and ("icov_diag" in obsmodel.keys())
+        and ("icov_offdiag" in obsmodel.keys())
+    ):
+        full_cov_mat = True
         ast_q_norm = np.asarray(obsmodel["q_norm"])[g0_indxs]
         ast_icov_diag = _as_model_filter(obsmodel["icov_diag"], n_filters)[g0_indxs]
-        two_ast_icov_offdiag = np.asarray(obsmodel["two_icov_offdiag"])[g0_indxs]
+        two_ast_icov_offdiag = 2.0 * np.asarray(obsmodel["icov_offdiag"])[g0_indxs]
     else:
-        ast_ivar = _as_model_filter(obsmodel["error"], n_filters)[g0_indxs]
-        ast_ivar = 1.0 / np.maximum(ast_ivar, np.finfo(np.float64).tiny) ** 2
+        ast_error = _as_model_filter(obsmodel["error"], n_filters)[g0_indxs]
+        ast_ivar = 1.0 / np.maximum(ast_error, np.finfo(np.float64).tiny) ** 2
+
+    if full_cov_mat:
+        print("using full covariance matrix")
+    else:
+        print("not using full covariance matrix")
 
     best_vals = np.zeros((n_obs, nq), dtype=np.float64)
     exp_vals = np.zeros((n_obs, nq), dtype=np.float64)
@@ -681,7 +702,7 @@ def Q_all_memory_batched(
         Y = Y_all[b0:b1]
         B = Y.shape[0]
 
-        if use_full_cov_matrix:
+        if full_cov_mat:
             lnp0, chi20 = _batched_fullcov_loglike(
                 Y,
                 mu,
@@ -1398,7 +1419,8 @@ def IAU_names_and_extra_info(obsdata, surveyname="PHAT", extraInfo=False):
             pad=True,
         )
 
-        r["Name"] = surveyname + " J" + ra_string + dec_string
+        r["Name"] = np.array([f"{surveyname} J{ra}{dec}" for ra, dec in zip(ra_string, dec_string)],dtype=str)
+    
 
         # other useful information
         r["RA"] = obsdata.data[ra_str]
