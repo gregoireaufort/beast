@@ -27,10 +27,14 @@ from beast.fitting.fit_metrics.likelihood import (
 from beast.fitting.fit_metrics import expectation, percentile
 from beast.fitting.pdf1d import pdf1d
 from beast.fitting.pdf2d import pdf2d
+from beast.tools.profiling import profile_stage, profile_summary
+
+_JAX_DIAG_LOGLIKE = None
 
 __all__ = [
     "summary_table_memory",
     "Q_all_memory",
+    "q_all_memory_batched_kernel",
     "IAU_names_and_extra_info",
     "save_stats",
     "save_pdf1d",
@@ -92,6 +96,43 @@ def save_stats(
     N/A
     """
 
+    with profile_stage("output writing", detail=stats_outname):
+        return _save_stats_impl(
+            stats_outname,
+            stats_dict_in,
+            best_vals,
+            exp_vals,
+            per_vals,
+            chi2_vals,
+            chi2_indx,
+            lnp_vals,
+            lnp_indx,
+            best_specgrid_indx,
+            total_log_norm,
+            qnames,
+            p,
+            filters,
+            wavelengths,
+        )
+
+
+def _save_stats_impl(
+    stats_outname,
+    stats_dict_in,
+    best_vals,
+    exp_vals,
+    per_vals,
+    chi2_vals,
+    chi2_indx,
+    lnp_vals,
+    lnp_indx,
+    best_specgrid_indx,
+    total_log_norm,
+    qnames,
+    p,
+    filters,
+    wavelengths,
+):
     stats_dict = stats_dict_in.copy()
 
     # populate the dict array
@@ -144,6 +185,11 @@ def save_pdf1d(pdf1d_outname, save_pdf1d_vals, qnames):
     N/A
     """
 
+    with profile_stage("output writing", detail=pdf1d_outname):
+        return _save_pdf1d_impl(pdf1d_outname, save_pdf1d_vals, qnames)
+
+
+def _save_pdf1d_impl(pdf1d_outname, save_pdf1d_vals, qnames):
     # write a small primary header
     fits.writeto(pdf1d_outname, np.zeros((2, 2)), overwrite=True)
 
@@ -174,6 +220,11 @@ def save_pdf2d(pdf2d_outname, save_pdf2d_vals, qname_pairs):
     N/A
     """
 
+    with profile_stage("output writing", detail=pdf2d_outname):
+        return _save_pdf2d_impl(pdf2d_outname, save_pdf2d_vals, qname_pairs)
+
+
+def _save_pdf2d_impl(pdf2d_outname, save_pdf2d_vals, qname_pairs):
     # write a small primary header
     fits.writeto(pdf2d_outname, np.zeros((2, 2)), overwrite=True)
 
@@ -202,6 +253,11 @@ def save_lnp(lnp_outname, save_lnp_vals):
     N/A
     """
 
+    with profile_stage("output writing", detail=lnp_outname):
+        return _save_lnp_impl(lnp_outname, save_lnp_vals)
+
+
+def _save_lnp_impl(lnp_outname, save_lnp_vals):
     # code needed if hdf5 is corrupted - usually due to job ending in the
     #    middle of the writing of the lnp file
     #  should be rare (not originally as the lnp file was open and
@@ -352,26 +408,17 @@ def _cdf_quantiles_from_pdf(pdf_vals, bin_vals, pcts):
     B, nbins = pdf_vals.shape
     out = np.zeros((B, len(p)), dtype=np.float64)
 
+    # Match beast.fitting.fit_metrics.common.percentile exactly: percentiles
+    # are interpolated at the center of each bin's weight, not at CDF edges.
     cdf = np.cumsum(pdf_vals, axis=1)
-    tot = cdf[:, -1]
-    valid = tot > 0
+    totals = cdf[:, -1]
+    valid = totals > 0.0
     if not np.any(valid):
         return out
 
-    cdfv = cdf[valid] / tot[valid, None]
-
-    for j, q in enumerate(p):
-        idx = np.argmax(cdfv >= q, axis=1)
-        idx0 = np.maximum(idx - 1, 0)
-
-        x0 = bin_vals[idx0]
-        x1 = bin_vals[idx]
-        y0 = cdfv[np.arange(cdfv.shape[0]), idx0]
-        y1 = cdfv[np.arange(cdfv.shape[0]), idx]
-
-        denom = np.where(np.abs(y1 - y0) > 0, y1 - y0, 1.0)
-        t = np.clip((q - y0) / denom, 0.0, 1.0)
-        out[valid, j] = x0 + t * (x1 - x0)
+    wpos = (cdf[valid] - 0.5 * pdf_vals[valid]) / totals[valid, None]
+    for i in range(wpos.shape[0]):
+        out[np.flatnonzero(valid)[i], :] = np.interp(p, wpos[i], bin_vals)
 
     return out
 
@@ -477,6 +524,48 @@ def _batched_diag_loglike(Y, mu, ivar):
     return lnP, chi2
 
 
+def _batched_diag_loglike_jax(Y, mu, ivar):
+    """JAX implementation of the diagonal batched likelihood."""
+    global _JAX_DIAG_LOGLIKE
+    try:
+        import jax
+        import jax.numpy as jnp
+    except ImportError as exc:
+        raise ImportError(
+            "backend='jax' requires jax to be installed; use backend='numpy' "
+            "or install jax separately."
+        ) from exc
+
+    jax.config.update("jax_enable_x64", True)
+
+    if _JAX_DIAG_LOGLIKE is None:
+
+        @jax.jit
+        def _kernel(Y_j, mu_j, ivar_j):
+            temp = 0.5 * jnp.log(2.0 * jnp.pi)
+            n = Y_j.shape[1]
+            lnQ = n * temp - 0.5 * jnp.sum(jnp.log(ivar_j), axis=1)
+
+            A = ivar_j * mu_j
+            c = jnp.einsum("mf,mf->m", A, mu_j, optimize=True)
+
+            chi2 = (Y_j * Y_j) @ ivar_j.T
+            chi2 = chi2 - 2.0 * (Y_j @ A.T)
+            chi2 = chi2 + c[None, :]
+
+            lnP = -lnQ[None, :] - 0.5 * chi2
+            return lnP, chi2
+
+        _JAX_DIAG_LOGLIKE = _kernel
+
+    lnp, chi2 = _JAX_DIAG_LOGLIKE(
+        jnp.asarray(Y, dtype=jnp.float64),
+        jnp.asarray(mu, dtype=jnp.float64),
+        jnp.asarray(ivar, dtype=jnp.float64),
+    )
+    return np.asarray(lnp), np.asarray(chi2)
+
+
 def _batched_fullcov_loglike(Y, mu, q_norm, icov_diag, two_icov_offdiag):
     """
     Batched version of N_covar_logLikelihood.
@@ -530,6 +619,165 @@ def _batched_fullcov_loglike(Y, mu, q_norm, icov_diag, two_icov_offdiag):
     return lnP, chi2
 
 
+def q_all_memory_batched_kernel(
+    Y_batch,
+    model_seds_with_bias,
+    log_prior_weights,
+    q_param_arrays,
+    pdf1d_bin_indices,
+    pdf1d_bin_values,
+    pdf2d_flat_indices=(),
+    pdf2d_shapes=(),
+    ast_ivar=None,
+    ast_q_norm=None,
+    ast_icov_diag=None,
+    two_ast_icov_offdiag=None,
+    use_full_cov_matrix=False,
+    threshold=-40.0,
+    p=(16.0, 50.0, 84.0),
+    compute_percentiles=True,
+    fit_use_topk=False,
+    fit_topk_mass_target=0.999,
+    fit_topk_ess_target=128.0,
+    fit_topk_kmin=32,
+    fit_topk_kmax=2048,
+    fit_topk_kquantile=0.95,
+    backend="numpy",
+):
+    """Pure array kernel for one batched fitting block.
+
+    All inputs are arrays/scalars and all returned values are arrays or lists
+    of arrays. File I/O, table handling, progress reporting, and grid object
+    access stay in the caller.
+    """
+    if backend not in {"numpy", "jax"}:
+        raise ValueError("backend must be either 'numpy' or 'jax'")
+
+    if use_full_cov_matrix:
+        if backend == "jax":
+            raise NotImplementedError(
+                "backend='jax' is only implemented for diagonal likelihoods"
+            )
+        lnp0, chi2 = _batched_fullcov_loglike(
+            Y_batch,
+            model_seds_with_bias,
+            ast_q_norm,
+            ast_icov_diag,
+            two_ast_icov_offdiag,
+        )
+    elif backend == "jax":
+        lnp0, chi2 = _batched_diag_loglike_jax(
+            Y_batch,
+            model_seds_with_bias,
+            ast_ivar,
+        )
+    else:
+        lnp0, chi2 = _batched_diag_loglike(
+            Y_batch,
+            model_seds_with_bias,
+            ast_ivar,
+        )
+
+    lnp = lnp0 + log_prior_weights[None, :]
+    B = Y_batch.shape[0]
+
+    max_lnp = np.max(np.where(np.isfinite(lnp), lnp, -np.inf), axis=1)
+    keep = (lnp - max_lnp[:, None]) > threshold
+
+    logw = lnp - max_lnp[:, None]
+    logw = np.where(keep, logw, -np.inf)
+    w = np.exp(np.clip(logw, -700.0, 0.0))
+    sumw = np.sum(w, axis=1, keepdims=True)
+    posterior_weights = np.divide(w, sumw, out=np.zeros_like(w), where=sumw > 0)
+
+    lnp_local_indices = np.argmax(lnp, axis=1)
+    chi2_local_indices = np.argmin(chi2, axis=1)
+    total_log_norm = max_lnp + np.log(sumw[:, 0])
+
+    if fit_use_topk:
+        order, K_star, K_batch, _, _, _ = _choose_topk_from_weights(
+            posterior_weights,
+            mass_target=fit_topk_mass_target,
+            ess_target=fit_topk_ess_target,
+            k_min=fit_topk_kmin,
+            k_max=fit_topk_kmax,
+            quantile=fit_topk_kquantile,
+            return_diagnostics=True,
+        )
+        weight_indices = order[:, :K_batch]
+        weights_used = np.take_along_axis(posterior_weights, weight_indices, axis=1)
+        weights_used /= np.maximum(
+            weights_used.sum(axis=1, keepdims=True), np.finfo(np.float64).tiny
+        )
+    else:
+        weight_indices = None
+        weights_used = posterior_weights
+
+    q_param_arrays = np.asarray(q_param_arrays, dtype=np.float64)
+    nq = q_param_arrays.shape[0]
+    best_vals = q_param_arrays[:, lnp_local_indices].T
+    exp_vals = np.zeros((B, nq), dtype=np.float64)
+
+    for k in range(nq):
+        q_act = q_param_arrays[k]
+        if fit_use_topk:
+            exp_vals[:, k] = np.sum(weights_used * q_act[weight_indices], axis=1)
+        else:
+            exp_vals[:, k] = weights_used @ q_act
+
+    p = tuple(p) if compute_percentiles else ()
+
+    pdf1d_batches = []
+    per_vals = np.zeros((B, nq, len(p)), dtype=np.float64)
+    for k, bin_idx in enumerate(pdf1d_bin_indices):
+        bin_vals = pdf1d_bin_values[k]
+        nb = len(bin_vals)
+        if fit_use_topk:
+            pdf_batch = _batch_hist1d_topk(bin_idx[weight_indices], weights_used, nb)
+        else:
+            pdf_batch = _batch_hist1d(bin_idx, weights_used, nb)
+
+        pdf1d_batches.append(pdf_batch)
+        if compute_percentiles:
+            per_vals[:, k, :] = _cdf_quantiles_from_pdf(pdf_batch, bin_vals, p)
+
+    pdf2d_batches = []
+    for flat_idx, shape in zip(pdf2d_flat_indices, pdf2d_shapes):
+        nb1, nb2 = shape
+        if fit_use_topk:
+            hist_flat = _batch_hist2d_topk(
+                flat_idx[weight_indices], weights_used, nb1 * nb2
+            )
+        else:
+            hist_flat = _batch_hist2d(flat_idx, weights_used, nb1 * nb2)
+        pdf2d_batches.append(hist_flat.reshape(B, nb1, nb2))
+
+    if fit_use_topk:
+        retained_local_indices = [weight_indices[i].copy() for i in range(B)]
+    else:
+        retained_local_indices = [np.where(keep[i])[0] for i in range(B)]
+
+    return {
+        "lnp": lnp,
+        "chi2": chi2,
+        "keep": keep,
+        "posterior_weights": posterior_weights,
+        "weights_used": weights_used,
+        "weight_indices": weight_indices,
+        "retained_local_indices": retained_local_indices,
+        "chi2_values": chi2[np.arange(B), chi2_local_indices],
+        "chi2_local_indices": chi2_local_indices,
+        "lnp_values": max_lnp,
+        "lnp_local_indices": lnp_local_indices,
+        "total_log_norm": total_log_norm,
+        "best_vals": best_vals,
+        "exp_vals": exp_vals,
+        "per_vals": per_vals,
+        "pdf1d_batches": pdf1d_batches,
+        "pdf2d_batches": pdf2d_batches,
+    }
+
+
 def Q_all_memory_batched(
     prev_result,
     obs,
@@ -557,6 +805,8 @@ def Q_all_memory_batched(
     fit_topk_kmin=32,
     fit_topk_kmax=2048,
     fit_topk_kquantile=0.95,
+    backend="numpy",
+    compute_percentiles=True,
 ):
     if resume:
         raise NotImplementedError("resume=True not implemented in Q_all_memory_batched.")
@@ -604,6 +854,7 @@ def Q_all_memory_batched(
 
     best_vals = np.zeros((n_obs, nq), dtype=np.float64)
     exp_vals = np.zeros((n_obs, nq), dtype=np.float64)
+    p = tuple(p) if compute_percentiles else ()
     per_vals = np.zeros((n_obs, nq, len(p)), dtype=np.float64)
 
     chi2_vals = np.zeros(n_obs, dtype=np.float64)
@@ -626,30 +877,34 @@ def Q_all_memory_batched(
         q_arrays_full.append(q_full)
         q_arrays_active.append(q_full[g0_indxs])
 
+    need_pdf1d = (pdf1d_outname is not None) or compute_percentiles
+
     pdf1d_infos = []
     save_pdf1d_vals = []
-    for qname in qnames:
-        qvals, nbins, logspacing, minval, maxval, uniqvals = setup_param_bins(
-            qname, max_nbins, sedgrid, full_model_flux, filters, grid_info_dict
-        )
-
-        if uniqvals is not None:
-            bin_vals = np.asarray(uniqvals, dtype=np.float64)
-        else:
-            bin_vals = (
-                np.logspace(np.log10(minval), np.log10(maxval), nbins)
-                if logspacing else
-                np.linspace(minval, maxval, nbins)
+    if need_pdf1d:
+        for qname in qnames:
+            qvals, nbins, logspacing, minval, maxval, uniqvals = setup_param_bins(
+                qname, max_nbins, sedgrid, full_model_flux, filters, grid_info_dict
             )
 
-        q_active = q_arrays_active[qnames.index(qname)]
-        idx = np.searchsorted(bin_vals, q_active, side="left")
-        idx = np.clip(idx, 0, len(bin_vals) - 1)
+            if uniqvals is not None:
+                bin_vals = np.asarray(uniqvals, dtype=np.float64)
+            else:
+                bin_vals = (
+                    np.logspace(np.log10(minval), np.log10(maxval), nbins)
+                    if logspacing else
+                    np.linspace(minval, maxval, nbins)
+                )
 
-        pdf1d_infos.append((bin_vals, idx, len(bin_vals)))
-        arr = np.zeros((n_obs + 2, len(bin_vals)), dtype=np.float32)
-        arr[-1, :] = bin_vals.astype(np.float32)
-        save_pdf1d_vals.append(arr)
+            q_active = q_arrays_active[qnames.index(qname)]
+            idx = np.searchsorted(bin_vals, q_active, side="left")
+            idx = np.clip(idx, 0, len(bin_vals) - 1)
+
+            pdf1d_infos.append((bin_vals, idx, len(bin_vals)))
+            if pdf1d_outname is not None:
+                arr = np.zeros((n_obs + 2, len(bin_vals)), dtype=np.float32)
+                arr[-1, :] = bin_vals.astype(np.float32)
+                save_pdf1d_vals.append(arr)
 
     if pdf2d_param_list is None:
         pdf2d_qname_pairs = []
@@ -694,105 +949,71 @@ def Q_all_memory_batched(
         arr[-1, :, :] = np.tile(bin2[None, :], (len(bin1), 1)).astype(np.float32)
         save_pdf2d_vals.append(arr)
 
+    q_param_arrays = np.vstack(q_arrays_active)
+    pdf1d_bin_values = [info[0] for info in pdf1d_infos]
+    pdf1d_bin_indices = [info[1] for info in pdf1d_infos]
+    pdf2d_flat_indices = [info[2] for info in pdf2d_infos]
+    pdf2d_shapes = [(info[3], info[4]) for info in pdf2d_infos]
+
     it = range(0, n_obs, fit_star_batch_size)
     for b0 in tqdm(it, total=int(np.ceil(n_obs / fit_star_batch_size)), desc="Batched Lnp/Stats"):
         b1 = min(n_obs, b0 + fit_star_batch_size)
         Y = Y_all[b0:b1]
         B = Y.shape[0]
 
-        if full_cov_mat:
-            lnp0, chi20 = _batched_fullcov_loglike(
+        with profile_stage("likelihood computation", detail="batched kernel"):
+            kernel_result = q_all_memory_batched_kernel(
                 Y,
                 mu,
-                ast_q_norm,
-                ast_icov_diag,
-                two_ast_icov_offdiag,
+                g0_weights,
+                q_param_arrays,
+                pdf1d_bin_indices,
+                pdf1d_bin_values,
+                pdf2d_flat_indices=pdf2d_flat_indices,
+                pdf2d_shapes=pdf2d_shapes,
+                ast_ivar=None if full_cov_mat else ast_ivar,
+                ast_q_norm=ast_q_norm if full_cov_mat else None,
+                ast_icov_diag=ast_icov_diag if full_cov_mat else None,
+                two_ast_icov_offdiag=two_ast_icov_offdiag if full_cov_mat else None,
+                use_full_cov_matrix=full_cov_mat,
+                threshold=threshold,
+                p=p,
+                compute_percentiles=compute_percentiles,
+                fit_use_topk=fit_use_topk,
+                fit_topk_mass_target=fit_topk_mass_target,
+                fit_topk_ess_target=fit_topk_ess_target,
+                fit_topk_kmin=fit_topk_kmin,
+                fit_topk_kmax=fit_topk_kmax,
+                fit_topk_kquantile=fit_topk_kquantile,
+                backend=backend,
             )
-        else:
-            lnp0, chi20 = _batched_diag_loglike(
-                Y,
-                mu,
-                ast_ivar,
-            )
 
-        lnp = lnp0 + g0_weights[None, :]
-
-        max_lnp = np.max(np.where(np.isfinite(lnp), lnp, -np.inf), axis=1)
-        keep = (lnp - max_lnp[:, None]) > threshold
-
-        logw = lnp - max_lnp[:, None]
-        logw = np.where(keep, logw, -np.inf)
-        w = np.exp(np.clip(logw, -700.0, 0.0))
-        sumw = np.sum(w, axis=1, keepdims=True)
-        W = np.divide(w, sumw, out=np.zeros_like(w), where=sumw > 0)
-
-        best_local = np.argmax(lnp, axis=1)
+        best_local = kernel_result["lnp_local_indices"]
         best_full = g0_indxs[best_local]
-        chi2_local = np.argmin(chi20, axis=1)
+        chi2_local = kernel_result["chi2_local_indices"]
         chi2_full = g0_indxs[chi2_local]
 
-        total_log_norm[b0:b1] = max_lnp + np.log(sumw[:, 0])
+        total_log_norm[b0:b1] = kernel_result["total_log_norm"]
         best_specgrid_indx[b0:b1] = g0_specgrid_indx[best_full]
-        chi2_vals[b0:b1] = chi20[np.arange(B), chi2_local]
+        chi2_vals[b0:b1] = kernel_result["chi2_values"]
         chi2_indx[b0:b1] = chi2_full
-        lnp_vals[b0:b1] = max_lnp
+        lnp_vals[b0:b1] = kernel_result["lnp_values"]
         lnp_indx[b0:b1] = best_full
 
-        if fit_use_topk:
-            order, K_star, K_batch, _, _, _ = _choose_topk_from_weights(
-                W,
-                mass_target=fit_topk_mass_target,
-                ess_target=fit_topk_ess_target,
-                k_min=fit_topk_kmin,
-                k_max=fit_topk_kmax,
-                quantile=fit_topk_kquantile,
-                return_diagnostics=True,
-            )
-            idx_use = order[:, :K_batch]
-            W_use = np.take_along_axis(W, idx_use, axis=1)
-            W_use /= np.maximum(W_use.sum(axis=1, keepdims=True), np.finfo(np.float64).tiny)
-        else:
-            idx_use = None
-            W_use = W
+        best_vals[b0:b1, :] = kernel_result["best_vals"]
+        exp_vals[b0:b1, :] = kernel_result["exp_vals"]
+        per_vals[b0:b1, :, :] = kernel_result["per_vals"]
 
-        for k in range(nq):
-            q_full = q_arrays_full[k]
-            q_act = q_arrays_active[k]
-            best_vals[b0:b1, k] = q_full[best_full]
+        if pdf1d_outname is not None:
+            for k, pdf_batch in enumerate(kernel_result["pdf1d_batches"]):
+                save_pdf1d_vals[k][b0:b1, :] = pdf_batch.astype(np.float32)
 
-            if fit_use_topk:
-                q_use = q_act[idx_use]
-                exp_vals[b0:b1, k] = np.sum(W_use * q_use, axis=1)
-            else:
-                exp_vals[b0:b1, k] = W_use @ q_act
-
-        for k in range(nq):
-            bin_vals, bin_idx, nb = pdf1d_infos[k]
-            if fit_use_topk:
-                bin_top = bin_idx[idx_use]
-                pdf_batch = _batch_hist1d_topk(bin_top, W_use, nb)
-            else:
-                pdf_batch = _batch_hist1d(bin_idx, W_use, nb)
-
-            save_pdf1d_vals[k][b0:b1, :] = pdf_batch.astype(np.float32)
-            per_vals[b0:b1, k, :] = _cdf_quantiles_from_pdf(pdf_batch, bin_vals, p)
-
-        for k, info in enumerate(pdf2d_infos):
-            bin1, bin2, flat_idx, nb1, nb2 = info
-            if fit_use_topk:
-                flat_top = flat_idx[idx_use]
-                hist_flat = _batch_hist2d_topk(flat_top, W_use, nb1 * nb2)
-            else:
-                hist_flat = _batch_hist2d(flat_idx, W_use, nb1 * nb2)
-
-            save_pdf2d_vals[k][b0:b1, :, :] = hist_flat.reshape(B, nb1, nb2).astype(np.float32)
+        for k, hist in enumerate(kernel_result["pdf2d_batches"]):
+            save_pdf2d_vals[k][b0:b1, :, :] = hist.astype(np.float32)
 
         if lnp_outname is not None:
             for bi in range(B):
-                if fit_use_topk:
-                    idx = idx_use[bi]
-                else:
-                    idx = np.where(keep[bi])[0]
+                idx = kernel_result["retained_local_indices"][bi]
 
                 if lnp_npts is not None and lnp_npts < len(idx):
                     idx = idx[:lnp_npts]
@@ -801,8 +1022,8 @@ def Q_all_memory_batched(
                 save_lnp_vals.append([
                     e,
                     np.array(g0_indxs[idx], dtype=np.int64),
-                    np.array(lnp[bi, idx], dtype=np.float32),
-                    np.array(chi20[bi, idx], dtype=np.float32),
+                    np.array(kernel_result["lnp"][bi, idx], dtype=np.float32),
+                    np.array(kernel_result["chi2"][bi, idx], dtype=np.float32),
                     np.array([Y[bi]]).T,
                 ])
 
@@ -834,6 +1055,7 @@ def Q_all_memory_batched(
     if lnp_outname is not None:
         save_lnp(lnp_outname, save_lnp_vals)
 
+    profile_summary("Q_all_memory_batched profile summary", reset=True)
     return None
 
 
@@ -858,6 +1080,7 @@ def Q_all_memory(
     resume=False,
     use_full_cov_matrix=True,
     do_not_normalize=False,
+    compute_percentiles=True,
 ):
     """
     Fit each star, calculate various fit statistics, and output them to files.
@@ -920,10 +1143,11 @@ def Q_all_memory(
     N/A
     """
 
-    if isinstance(sedgrid, str):
-        g0 = grid.SEDGrid(sedgrid, backend=gridbackend)
-    else:
-        g0 = sedgrid
+    with profile_stage("loading physics/noise grids", detail="Q_all_memory sedgrid"):
+        if isinstance(sedgrid, str):
+            g0 = grid.SEDGrid(sedgrid, backend=gridbackend)
+        else:
+            g0 = sedgrid
 
     # remove weights that are less than zero
     (g0_indxs,) = np.where(g0["weight"] > 0.0)
@@ -991,6 +1215,8 @@ def Q_all_memory(
     # full_model_flux = np.sign(logtempseds) * np.log10(1 + np.abs(logtempseds * math.log(10)))
     full_model_flux = symlog(model_seds_with_bias)
 
+    p = list(p) if compute_percentiles else []
+
     # setup the arrays to temp store the results
     n_qnames = len(qnames)
     n_pers = len(p)
@@ -1008,96 +1234,102 @@ def Q_all_memory(
     save_lnp_vals = []
 
     # setup the mapping for the 1D PDFs
+    need_pdf1d = (pdf1d_outname is not None) or compute_percentiles
     fast_pdf1d_objs = []
     save_pdf1d_vals = []
 
     # make 1D PDF objects
-    for qname in qnames:
+    if need_pdf1d:
+        with profile_stage("PDF1D/PDF2D generation", detail="setup 1D PDF bins"):
+            for qname in qnames:
 
-        # get bin properties
-        qname_vals, nbins, logspacing, minval, maxval, uniqvals = setup_param_bins(
-            qname, max_nbins, g0, full_model_flux, filters, grid_info_dict
-        )
+                # get bin properties
+                qname_vals, nbins, logspacing, minval, maxval, uniqvals = setup_param_bins(
+                    qname, max_nbins, g0, full_model_flux, filters, grid_info_dict
+                )
 
-        # generate the fast 1d pdf mapping
-        _tpdf1d = pdf1d(
-            qname_vals,
-            nbins,
-            logspacing=logspacing,
-            minval=minval,
-            maxval=maxval,
-            uniqvals=uniqvals,
-        )
-        fast_pdf1d_objs.append(_tpdf1d)
+                # generate the fast 1d pdf mapping
+                _tpdf1d = pdf1d(
+                    qname_vals,
+                    nbins,
+                    logspacing=logspacing,
+                    minval=minval,
+                    maxval=maxval,
+                    uniqvals=uniqvals,
+                )
+                fast_pdf1d_objs.append(_tpdf1d)
 
-        # setup the arrays to save the 1d PDFs
-        save_pdf1d_vals.append(np.zeros((nobs + 1, nbins)))
-        save_pdf1d_vals[-1][-1, :] = _tpdf1d.bin_vals
+                # setup the arrays to save the 1d PDFs
+                if pdf1d_outname is not None:
+                    save_pdf1d_vals.append(np.zeros((nobs + 1, nbins)))
+                    save_pdf1d_vals[-1][-1, :] = _tpdf1d.bin_vals
 
     # if chosen, make 2D PDFs
     if pdf2d_outname is not None:
+        with profile_stage("PDF1D/PDF2D generation", detail="setup 2D PDF bins"):
+            # setup the 2D PDFs
+            _pdf2d_params = [
+                qname
+                for qname in qnames
+                if qname in pdf2d_param_list and len(np.unique(g0[qname])) > 1
+            ]
+            _n_params = len(_pdf2d_params)
+            pdf2d_qname_pairs = [
+                _pdf2d_params[i] + "+" + _pdf2d_params[j]
+                for i in range(_n_params)
+                for j in range(i + 1, _n_params)
+            ]
+            fast_pdf2d_objs = []
+            save_pdf2d_vals = []
 
-        # setup the 2D PDFs
-        _pdf2d_params = [
-            qname
-            for qname in qnames
-            if qname in pdf2d_param_list and len(np.unique(g0[qname])) > 1
-        ]
-        _n_params = len(_pdf2d_params)
-        pdf2d_qname_pairs = [
-            _pdf2d_params[i] + "+" + _pdf2d_params[j]
-            for i in range(_n_params)
-            for j in range(i + 1, _n_params)
-        ]
-        fast_pdf2d_objs = []
-        save_pdf2d_vals = []
+            # make 2D PDF objects
+            for qname_pair in pdf2d_qname_pairs:
+                qname_1, qname_2 = qname_pair.split("+")
 
-        # make 2D PDF objects
-        for qname_pair in pdf2d_qname_pairs:
-            qname_1, qname_2 = qname_pair.split("+")
+                # get bin properties
+                (
+                    qname_vals_p1,
+                    nbins_p1,
+                    logspacing_p1,
+                    minval_p1,
+                    maxval_p1,
+                    uniqvals_p1,
+                ) = setup_param_bins(
+                    qname_1, max_nbins, g0, full_model_flux, filters, grid_info_dict
+                )
+                (
+                    qname_vals_p2,
+                    nbins_p2,
+                    logspacing_p2,
+                    minval_p2,
+                    maxval_p2,
+                    uniqvals_p2,
+                ) = setup_param_bins(
+                    qname_2, max_nbins, g0, full_model_flux, filters, grid_info_dict
+                )
 
-            # get bin properties
-            (
-                qname_vals_p1,
-                nbins_p1,
-                logspacing_p1,
-                minval_p1,
-                maxval_p1,
-                uniqvals_p1,
-            ) = setup_param_bins(
-                qname_1, max_nbins, g0, full_model_flux, filters, grid_info_dict
-            )
-            (
-                qname_vals_p2,
-                nbins_p2,
-                logspacing_p2,
-                minval_p2,
-                maxval_p2,
-                uniqvals_p2,
-            ) = setup_param_bins(
-                qname_2, max_nbins, g0, full_model_flux, filters, grid_info_dict
-            )
-
-            # make 2D PDF
-            _tpdf2d = pdf2d(
-                qname_vals_p1,
-                qname_vals_p2,
-                nbins_p1,
-                nbins_p2,
-                logspacing_p1=logspacing_p1,
-                logspacing_p2=logspacing_p2,
-                minval_p1=minval_p1,
-                maxval_p1=maxval_p1,
-                minval_p2=minval_p2,
-                maxval_p2=maxval_p2,
-            )
-            fast_pdf2d_objs.append(_tpdf2d)
-            # arrays for the PDFs and bins
-            save_pdf2d_vals.append(np.zeros((nobs + 2, nbins_p1, nbins_p2)))
-            save_pdf2d_vals[-1][-2, :, :] = np.tile(
-                _tpdf2d.bin_vals_p1, (nbins_p2, 1)
-            ).T
-            save_pdf2d_vals[-1][-1, :, :] = np.tile(_tpdf2d.bin_vals_p2, (nbins_p1, 1))
+                # make 2D PDF
+                _tpdf2d = pdf2d(
+                    qname_vals_p1,
+                    qname_vals_p2,
+                    nbins_p1,
+                    nbins_p2,
+                    logspacing_p1=logspacing_p1,
+                    logspacing_p2=logspacing_p2,
+                    minval_p1=minval_p1,
+                    maxval_p1=maxval_p1,
+                    minval_p2=minval_p2,
+                    maxval_p2=maxval_p2,
+                )
+                fast_pdf2d_objs.append(_tpdf2d)
+                # arrays for the PDFs and bins
+                save_pdf2d_vals.append(np.zeros((nobs + 2, nbins_p1, nbins_p2)))
+                save_pdf2d_vals[-1][-2, :, :] = np.tile(
+                    _tpdf2d.bin_vals_p1, (nbins_p2, 1)
+                ).T
+                save_pdf2d_vals[-1][-1, :, :] = np.tile(
+                    _tpdf2d.bin_vals_p2, (nbins_p1, 1)
+                )
 
     # if this is a resume job, read in the already computed stats and
     #     fill the variables
@@ -1145,12 +1377,13 @@ def Q_all_memory(
 
         # setup a new lnp file
         if lnp_outname is not None:
-            outfile = tables.open_file(lnp_outname, "w")
-            # Save wavelengths in root, remember #n_stars = root._v_nchildren -1
-            outfile.create_array(outfile.root, "grid_waves", g0.lamb[:])
-            filters = obs.getFilters()
-            outfile.create_array(outfile.root, "obs_filters", filters[:])
-            outfile.close()
+            with profile_stage("output writing", detail=lnp_outname):
+                outfile = tables.open_file(lnp_outname, "w")
+                # Save wavelengths in root, remember #n_stars = root._v_nchildren -1
+                outfile.create_array(outfile.root, "grid_waves", g0.lamb[:])
+                filters = obs.getFilters()
+                outfile.create_array(outfile.root, "obs_filters", filters[:])
+                outfile.close()
 
     # loop over the objects and get all the requested quantities
     g0_specgrid_indx = g0["specgrid_indx"]
@@ -1171,50 +1404,53 @@ def Q_all_memory(
         # currently, set mask to False always
         cur_mask[:] = False
 
-        if full_cov_mat:
-            lnp, chi2 = N_covar_logLikelihood(
-                sed,
-                model_seds_with_bias,
-                ast_q_norm,
-                ast_icov_diag,
-                two_ast_icov_offdiag,
-                lnp_threshold=abs(threshold),
-            )
-        else:
-            lnp, chi2 = N_logLikelihood_NM(
-                sed,
-                model_seds_with_bias,
-                ast_ivar,
-                mask=cur_mask,
-                lnp_threshold=abs(threshold),
-            )
+        with profile_stage("likelihood computation"):
+            if full_cov_mat:
+                lnp, chi2 = N_covar_logLikelihood(
+                    sed,
+                    model_seds_with_bias,
+                    ast_q_norm,
+                    ast_icov_diag,
+                    two_ast_icov_offdiag,
+                    lnp_threshold=abs(threshold),
+                )
+            else:
+                lnp, chi2 = N_logLikelihood_NM(
+                    sed,
+                    model_seds_with_bias,
+                    ast_ivar,
+                    mask=cur_mask,
+                    lnp_threshold=abs(threshold),
+                )
 
-        lnp = lnp[g0_indxs]
-        chi2 = chi2[g0_indxs]
-        # lnp = numexpr.evaluate('lnp + g0_weights')
-        lnp += g0_weights  # multiply by the prior weights (sum in log space)
+            lnp = lnp[g0_indxs]
+            chi2 = chi2[g0_indxs]
 
-        (indx,) = np.where((lnp - max(lnp[np.isfinite(lnp)])) > threshold)
+        with profile_stage("posterior normalization/top-k"):
+            # lnp = numexpr.evaluate('lnp + g0_weights')
+            lnp += g0_weights  # multiply by the prior weights (sum in log space)
 
-        # now generate the sparse likelihood (remove later if this works
-        #       by updating code below)
-        #   checked if changing to the full likelihood speeds things up
-        #       - the answer is no
-        #   and is likely related to the switch here to the sparse
-        #       likelihood for the weight calculation
-        lnps = lnp[indx]
-        chi2s = chi2[indx]
+            (indx,) = np.where((lnp - max(lnp[np.isfinite(lnp)])) > threshold)
 
-        # log_norm = np.log(getNorm_lnP(lnps))
-        # if not np.isfinite(log_norm):
-        #    log_norm = lnps.max()
-        log_norm = lnps.max()
-        weights = np.exp(lnps - log_norm)
+            # now generate the sparse likelihood (remove later if this works
+            #       by updating code below)
+            #   checked if changing to the full likelihood speeds things up
+            #       - the answer is no
+            #   and is likely related to the switch here to the sparse
+            #       likelihood for the weight calculation
+            lnps = lnp[indx]
+            chi2s = chi2[indx]
 
-        # normalize the weights make sure they sum to one
-        #   needed for np.random.choice
-        weight_sum = np.sum(weights)
-        weights /= weight_sum
+            # log_norm = np.log(getNorm_lnP(lnps))
+            # if not np.isfinite(log_norm):
+            #    log_norm = lnps.max()
+            log_norm = lnps.max()
+            weights = np.exp(lnps - log_norm)
+
+            # normalize the weights make sure they sum to one
+            #   needed for np.random.choice
+            weight_sum = np.sum(weights)
+            weights /= weight_sum
 
         # save the current set of lnps
         if lnp_outname is not None:
@@ -1240,19 +1476,20 @@ def Q_all_memory(
         # - log_norm - log(weight_sum))) = 1, the relative weight of
         # each subgrid will be exp(log_norm + log(weight_sum)).
         # Therefore, we also store the following quantity:
-        total_log_norm[e] = log_norm + np.log(weight_sum)
+        with profile_stage("summary statistics"):
+            total_log_norm[e] = log_norm + np.log(weight_sum)
 
-        # index to the full model grid for the best fit values
-        best_full_indx = g0_indxs[indx[weights.argmax()]]
+            # index to the full model grid for the best fit values
+            best_full_indx = g0_indxs[indx[weights.argmax()]]
 
-        # index to the spectral grid
-        best_specgrid_indx[e] = g0_specgrid_indx[best_full_indx]
+            # index to the spectral grid
+            best_specgrid_indx[e] = g0_specgrid_indx[best_full_indx]
 
-        # goodness of fit quantities
-        chi2_vals[e] = chi2s.min()
-        chi2_indx[e] = g0_indxs[indx[chi2s.argmin()]]
-        lnp_vals[e] = lnps.max()
-        lnp_indx[e] = best_full_indx
+            # goodness of fit quantities
+            chi2_vals[e] = chi2s.min()
+            chi2_indx[e] = g0_indxs[indx[chi2s.argmin()]]
+            lnp_vals[e] = lnps.max()
+            lnp_indx[e] = best_full_indx
 
         # calculate quantities for individual parameters:
         # best value, expectation value, 1D PDF, percentiles
@@ -1263,30 +1500,40 @@ def Q_all_memory(
             else:
                 q = g0[qname]
 
-            # best value
-            best_vals[e, k] = q[best_full_indx]
+            with profile_stage("summary statistics"):
+                # best value
+                best_vals[e, k] = q[best_full_indx]
 
-            # expectation value
-            exp_vals[e, k] = expectation(q[g0_indxs[indx]], weights=weights)
+                # expectation value
+                exp_vals[e, k] = expectation(q[g0_indxs[indx]], weights=weights)
 
-            # percentile values
-            pdf1d_bins, pdf1d_vals = fast_pdf1d_objs[k].gen1d(g0_indxs[indx], weights)
+            if need_pdf1d:
+                with profile_stage("PDF1D/PDF2D generation"):
+                    # percentile values and/or saved 1D PDFs
+                    pdf1d_bins, pdf1d_vals = fast_pdf1d_objs[k].gen1d(
+                        g0_indxs[indx], weights
+                    )
 
-            save_pdf1d_vals[k][e, :] = pdf1d_vals
-            if pdf1d_vals.max() > 0:
-                # remove normalization to allow for post processing with
-                #   different distance runs (needed for the SMIDGE-SMC)
-                # pdf1d_vals /= pdf1d_vals.max()
-                per_vals[e, k, :] = percentile(pdf1d_bins, _p, weights=pdf1d_vals)
-            else:
-                per_vals[e, k, :] = [0.0, 0.0, 0.0]
+                    if pdf1d_outname is not None:
+                        save_pdf1d_vals[k][e, :] = pdf1d_vals
+                    if compute_percentiles:
+                        if pdf1d_vals.max() > 0:
+                            # remove normalization to allow for post processing with
+                            #   different distance runs (needed for the SMIDGE-SMC)
+                            # pdf1d_vals /= pdf1d_vals.max()
+                            per_vals[e, k, :] = percentile(
+                                pdf1d_bins, _p, weights=pdf1d_vals
+                            )
+                        else:
+                            per_vals[e, k, :] = np.zeros(len(p), dtype=float)
 
         # calculate 2D PDFs for the subset of parameter pairs
         if pdf2d_outname is not None:
-            for k in range(len(pdf2d_qname_pairs)):
-                save_pdf2d_vals[k][e, :, :] = fast_pdf2d_objs[k].gen2d(
-                    g0_indxs[indx], weights
-                )
+            with profile_stage("PDF1D/PDF2D generation"):
+                for k in range(len(pdf2d_qname_pairs)):
+                    save_pdf2d_vals[k][e, :, :] = fast_pdf2d_objs[k].gen2d(
+                        g0_indxs[indx], weights
+                    )
 
         # incremental save (useful if job dies early to recover most
         #    of the computations)
@@ -1358,6 +1605,8 @@ def Q_all_memory(
     # save the lnps
     if lnp_outname is not None:
         save_lnp(lnp_outname, save_lnp_vals)
+
+    profile_summary("Q_all_memory profile summary", reset=True)
 
 
 def IAU_names_and_extra_info(obsdata, surveyname="PHAT", extraInfo=False):
@@ -1472,6 +1721,8 @@ def summary_table_memory(
     fit_topk_kmin=32,
     fit_topk_kmax=2048,
     fit_topk_kquantile=0.95,
+    backend="numpy",
+    compute_percentiles=True,
 ):
     """
     Do the fitting in memory
@@ -1527,6 +1778,8 @@ def summary_table_memory(
         should have no effect on the final outcome when using only a
         single grid, but is essential when using the subgridding
         approach.
+    backend : {"numpy", "jax"}
+        numerical backend for the batched fitting kernel
 
     Returns
     -------
@@ -1568,6 +1821,7 @@ def summary_table_memory(
             noisemodel,
             keys,
             p=[16.0, 50.0, 84.0],
+            compute_percentiles=compute_percentiles,
             resume=resume,
             threshold=threshold,
             save_every_npts=save_every_npts,
@@ -1588,6 +1842,7 @@ def summary_table_memory(
             fit_topk_kmin=fit_topk_kmin,
             fit_topk_kmax=fit_topk_kmax,
             fit_topk_kquantile=fit_topk_kquantile,
+            backend=backend,
         )
     else:
         Q_all_memory(
@@ -1597,6 +1852,7 @@ def summary_table_memory(
             noisemodel,
             keys,
             p=[16.0, 50.0, 84.0],
+            compute_percentiles=compute_percentiles,
             resume=resume,
             threshold=threshold,
             save_every_npts=save_every_npts,

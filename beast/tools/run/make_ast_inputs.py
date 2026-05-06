@@ -15,6 +15,7 @@ from beast.observationmodel.ast.make_ast_input_list import (
 )
 from beast.observationmodel.ast import make_ast_xy_list
 from beast.tools import beast_settings
+from beast.tools.profiling import profile_stage
 
 
 def make_ast_inputs(beast_settings_info, pick_method="flux_bin_method"):
@@ -35,6 +36,11 @@ def make_ast_inputs(beast_settings_info, pick_method="flux_bin_method"):
 
     """
 
+    with profile_stage("AST input generation", log_event=True):
+        return _make_ast_inputs_impl(beast_settings_info, pick_method)
+
+
+def _make_ast_inputs_impl(beast_settings_info, pick_method="flux_bin_method"):
     # process beast settings info
     if isinstance(beast_settings_info, str):
         settings = beast_settings.beast_settings(beast_settings_info)

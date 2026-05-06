@@ -3,6 +3,7 @@ import tables
 
 from beast.physicsmodel.grid import SEDGrid
 from astropy.table import Table
+from beast.tools.profiling import profile_stage
 
 __all__ = ["trim_models"]
 
@@ -50,6 +51,31 @@ def trim_models(
     trunchen : bool, optional
         if true use the trunchen noise model (default: False)
     """
+    with profile_stage("trimming", detail=sed_outname, log_event=True):
+        return _trim_models_impl(
+            sedgrid,
+            sedgrid_noisemodel,
+            obsdata,
+            sed_outname,
+            noisemodel_outname,
+            sigma_fac=sigma_fac,
+            n_detected=n_detected,
+            inFlux=inFlux,
+            trunchen=trunchen,
+        )
+
+
+def _trim_models_impl(
+    sedgrid,
+    sedgrid_noisemodel,
+    obsdata,
+    sed_outname,
+    noisemodel_outname,
+    sigma_fac=3.0,
+    n_detected=4,
+    inFlux=True,
+    trunchen=False,
+):
     # Store the brigtest and faintest fluxes in each band (for data and asts)
     n_filters = len(obsdata.filters)
     min_data = np.zeros(n_filters)

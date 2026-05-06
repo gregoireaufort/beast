@@ -30,12 +30,15 @@ from beast.physicsmodel.grid_weights import compute_grid_weights
 from astropy.table import Table
 from beast.tools.helpers import generator
 from beast.tools import helpers
+from beast.tools.profiling import profile_stage
 
 from beast.observationmodel.noisemodel import absflux_covmat
+from beast.observationmodel import phot
 
 __all__ = [
     "gen_spectral_grid_from_stellib_given_points",
     "make_extinguished_grid",
+    "make_extinguished_grid_fast",
     "add_spectral_properties",
     "calc_absflux_cov_matrices",
 ]
@@ -78,19 +81,26 @@ def gen_spectral_grid_from_stellib_given_points(
     helpers.type_checker("osl", osl, stellib.Stellib)
 
     if chunksize <= 0:
-        yield osl.gen_spectral_grid_from_given_points(pts, bounds=bounds)
+        with profile_stage("physics: stellar spectral interpolation"):
+            yield osl.gen_spectral_grid_from_given_points(pts, bounds=bounds)
     else:
         try:
             # Yield successive n-sized chunks from l, assuming we can take
             # slices of the iterator
             for chunk_slice in helpers.chunks(list(range(len(pts))), chunksize):
                 chunk_pts = pts[chunk_slice]
-                yield osl.gen_spectral_grid_from_given_points(chunk_pts, bounds=bounds)
+                with profile_stage("physics: stellar spectral interpolation"):
+                    yield osl.gen_spectral_grid_from_given_points(
+                        chunk_pts, bounds=bounds
+                    )
         except Exception as e:
             # chunks may not work on this as pts is most likely a Table
             print(e)
             for chunk_pts in helpers.chunks(pts, chunksize):
-                yield osl.gen_spectral_grid_from_given_points(chunk_pts, bounds=bounds)
+                with profile_stage("physics: stellar spectral interpolation"):
+                    yield osl.gen_spectral_grid_from_given_points(
+                        chunk_pts, bounds=bounds
+                    )
 
 
 def _make_dust_fA_valid_points_generator(it, min_Rv, max_Rv, Rv_B):
@@ -143,6 +153,50 @@ def _make_dust_fA_valid_points_generator(it, min_Rv, max_Rv, Rv_B):
     )
 
     return npts, pts
+
+
+def _filter_integration_matrix(lamb, filters, absFlux=True):
+    """
+    Build the linear operator used by phot.extractSEDs.
+
+    The resulting matrix has shape (n_wavelength, n_filters), so
+    ``spectra @ matrix`` is numerically equivalent to extracting SEDs one
+    filter at a time with the existing trapezoid integration.
+    """
+    lamb = np.asarray(lamb)
+    matrix = np.zeros((lamb.size, len(filters)), dtype=float)
+    cls = np.empty(len(filters), dtype=float)
+
+    for f_indx, filt in enumerate(filters):
+        xl = filt.transmit > 0.0
+        if not np.any(xl):
+            cls[f_indx] = filt.cl
+            continue
+
+        x = lamb[xl]
+        trap_weights = np.empty(x.size, dtype=float)
+        if x.size == 1:
+            trap_weights[0] = 0.0
+        else:
+            trap_weights[0] = 0.5 * (x[1] - x[0])
+            trap_weights[-1] = 0.5 * (x[-1] - x[-2])
+            if x.size > 2:
+                trap_weights[1:-1] = 0.5 * (x[2:] - x[:-2])
+
+        weights = x * filt.transmit[xl] * trap_weights / filt.lT
+        if absFlux:
+            weights = weights / phot.distc
+        matrix[xl, f_indx] = weights
+        cls[f_indx] = filt.cl
+
+    return cls, matrix
+
+
+def _log_sed_columns(seds):
+    log_seds = np.full(seds.shape, -100.0, dtype=float)
+    good = seds > 0
+    log_seds[good] = np.log10(seds[good])
+    return log_seds
 
 
 def apply_distance_grid(specgrid, distances, redshift=0):
@@ -389,85 +443,90 @@ def make_extinguished_grid(
             _cov_diag = np.zeros((N, n_filters), dtype=float)
             _cov_offdiag = np.zeros((N, n_offdiag), dtype=float)
 
-        for count, pt in enumerate(tqdm(chunk_pts, desc="SED grid")):
+        with profile_stage("physics: dust SED generation"):
+            for count, pt in enumerate(tqdm(chunk_pts, desc="SED grid")):
 
-            if with_fA:
-                Av, Rv, f_A = pt
-                Rv_MW = extLaw.get_Rv_A(Rv, f_A)
+                if with_fA:
+                    Av, Rv, f_A = pt
+                    Rv_MW = extLaw.get_Rv_A(Rv, f_A)
 
-                r = g0.applyExtinctionLaw(extLaw, Av=Av, Rv=Rv, f_A=f_A, inplace=False)
-                # add extra "spectral bands" if requested
-                if add_spectral_properties_kwargs is not None:
-                    r = add_spectral_properties(
-                        r,
-                        nameformat=nameformat,
-                        filterLib=filterLib,
-                        **add_spectral_properties_kwargs,
+                    r = g0.applyExtinctionLaw(
+                        extLaw, Av=Av, Rv=Rv, f_A=f_A, inplace=False
                     )
-                temp_results = r.getSEDs(filter_names, filterLib=filterLib)
-                # adding the dust parameters to the models
-                cols["Av"][N0 * count : N0 * (count + 1)] = Av
-                cols["Rv"][N0 * count : N0 * (count + 1)] = Rv
-                cols["f_A"][N0 * count : N0 * (count + 1)] = f_A
-                cols["Rv_A"][N0 * count : N0 * (count + 1)] = Rv_MW
+                    # add extra "spectral bands" if requested
+                    if add_spectral_properties_kwargs is not None:
+                        r = add_spectral_properties(
+                            r,
+                            nameformat=nameformat,
+                            filterLib=filterLib,
+                            **add_spectral_properties_kwargs,
+                        )
+                    temp_results = r.getSEDs(filter_names, filterLib=filterLib)
+                    # adding the dust parameters to the models
+                    cols["Av"][N0 * count : N0 * (count + 1)] = Av
+                    cols["Rv"][N0 * count : N0 * (count + 1)] = Rv
+                    cols["f_A"][N0 * count : N0 * (count + 1)] = f_A
+                    cols["Rv_A"][N0 * count : N0 * (count + 1)] = Rv_MW
 
-            else:
-                Av, Rv = pt
-                r = g0.applyExtinctionLaw(extLaw, Av=Av, Rv=Rv, inplace=False)
+                else:
+                    Av, Rv = pt
+                    r = g0.applyExtinctionLaw(extLaw, Av=Av, Rv=Rv, inplace=False)
 
-                if add_spectral_properties_kwargs is not None:
-                    r = add_spectral_properties(
-                        r,
-                        nameformat=nameformat,
-                        filterLib=filterLib,
-                        **add_spectral_properties_kwargs,
-                    )
-                temp_results = r.getSEDs(filter_names, filterLib=filterLib)
-                # adding the dust parameters to the models
-                cols["Av"][N0 * count : N0 * (count + 1)] = Av
-                cols["Rv"][N0 * count : N0 * (count + 1)] = Rv
+                    if add_spectral_properties_kwargs is not None:
+                        r = add_spectral_properties(
+                            r,
+                            nameformat=nameformat,
+                            filterLib=filterLib,
+                            **add_spectral_properties_kwargs,
+                        )
+                    temp_results = r.getSEDs(filter_names, filterLib=filterLib)
+                    # adding the dust parameters to the models
+                    cols["Av"][N0 * count : N0 * (count + 1)] = Av
+                    cols["Rv"][N0 * count : N0 * (count + 1)] = Rv
 
-            # compute the dust weights
-            dust_prior_weight = compute_av_rv_fA_prior_weights(
-                Av,
-                Rv,
-                f_A,
-                g0.grid["distance"].data,
-                av_prior_model=av_prior_model,
-                rv_prior_model=rv_prior_model,
-                fA_prior_model=fA_prior_model,
-            )
-
-            # get new attributes if exist
-            for key in list(temp_results.grid.keys()):
-                if key not in keys:
-                    k1 = N0 * count
-                    k2 = N0 * (count + 1)
-                    cols.setdefault(key, np.zeros(N, dtype=float))[k1:k2] = (
-                        temp_results.grid[key]
-                    )
-
-            # compute the fractional absflux covariance matrices
-            if absflux_cov:
-                absflux_covmats = calc_absflux_cov_matrices(
-                    r, temp_results, filter_names
+                # compute the dust weights
+                dust_prior_weight = compute_av_rv_fA_prior_weights(
+                    Av,
+                    Rv,
+                    f_A,
+                    g0.grid["distance"].data,
+                    av_prior_model=av_prior_model,
+                    rv_prior_model=rv_prior_model,
+                    fA_prior_model=fA_prior_model,
                 )
-                _cov_diag[N0 * count : N0 * (count + 1)] = absflux_covmats[0]
-                _cov_offdiag[N0 * count : N0 * (count + 1)] = absflux_covmats[1]
 
-            # assign the extinguished SEDs to the output object
-            _seds[N0 * count : N0 * (count + 1)] = temp_results.seds[:]
+                # get new attributes if exist
+                for key in list(temp_results.grid.keys()):
+                    if key not in keys:
+                        k1 = N0 * count
+                        k2 = N0 * (count + 1)
+                        cols.setdefault(key, np.zeros(N, dtype=float))[k1:k2] = (
+                            temp_results.grid[key]
+                        )
 
-            # copy the rest of the parameters
-            for key in keys:
-                cols[key][N0 * count : N0 * (count + 1)] = g0.grid[key]
+                # compute the fractional absflux covariance matrices
+                if absflux_cov:
+                    absflux_covmats = calc_absflux_cov_matrices(
+                        r, temp_results, filter_names
+                    )
+                    _cov_diag[N0 * count : N0 * (count + 1)] = absflux_covmats[0]
+                    _cov_offdiag[N0 * count : N0 * (count + 1)] = absflux_covmats[1]
 
-            # multiply existing prior weights by the dust prior weight
-            cols["weight"][N0 * count : N0 * (count + 1)] *= dust_prior_weight
-            cols["prior_weight"][N0 * count : N0 * (count + 1)] *= dust_prior_weight
+                # assign the extinguished SEDs to the output object
+                _seds[N0 * count : N0 * (count + 1)] = temp_results.seds[:]
 
-            if count == 0:
-                cols["lamb"] = temp_results.lamb[:]
+                # copy the rest of the parameters
+                for key in keys:
+                    cols[key][N0 * count : N0 * (count + 1)] = g0.grid[key]
+
+                # multiply existing prior weights by the dust prior weight
+                cols["weight"][N0 * count : N0 * (count + 1)] *= dust_prior_weight
+                cols["prior_weight"][
+                    N0 * count : N0 * (count + 1)
+                ] *= dust_prior_weight
+
+                if count == 0:
+                    cols["lamb"] = temp_results.lamb[:]
 
         _lamb = cols.pop("lamb")
 
@@ -509,6 +568,224 @@ def make_extinguished_grid(
 
         g.header["filters"] = " ".join(filter_names)
 
+        yield g
+
+
+@generator
+def make_extinguished_grid_fast(
+    spec_grid,
+    filter_names,
+    extLaw,
+    avs,
+    rvs,
+    fAs=None,
+    av_prior_model={"name": "flat"},
+    rv_prior_model={"name": "flat"},
+    fA_prior_model={"name": "flat"},
+    chunksize=0,
+    add_spectral_properties_kwargs=None,
+    absflux_cov=False,
+    filterLib=None,
+):
+    """
+    Vectorized equivalent of make_extinguished_grid for the common SED case.
+
+    This path keeps the same dust-point ordering and table columns as the
+    original implementation, but preloads filters and precomputes the trapezoid
+    integration operator once. It intentionally does not implement absolute
+    flux covariance matrices, where the existing object path is still the
+    reference implementation.
+    """
+    if absflux_cov:
+        raise NotImplementedError(
+            "make_extinguished_grid_fast does not support absflux_cov"
+        )
+
+    add_props = None
+    if add_spectral_properties_kwargs is not None:
+        add_props = dict(add_spectral_properties_kwargs)
+        if add_props.get("callables") is not None:
+            raise NotImplementedError(
+                "make_extinguished_grid_fast does not support callable spectral properties"
+            )
+
+    if isinstance(spec_grid, str):
+        ext = spec_grid.split(".")[-1]
+        if ext in ["hdf", "hd5", "hdf5"]:
+            g0 = SpectralGrid(spec_grid, backend="disk")
+        else:
+            g0 = SpectralGrid(spec_grid, backend="cache")
+    else:
+        helpers.type_checker("spec_grid", spec_grid, SpectralGrid)
+        g0 = spec_grid
+
+    with_fA = fAs is not None
+    min_Rv = min(rvs)
+    max_Rv = max(rvs)
+
+    if with_fA:
+        Rv_B = extLaw.BLaw.Rv
+        it = np.nditer(np.ix_(avs, rvs, fAs))
+        niter = np.size(avs) * np.size(rvs) * np.size(fAs)
+        npts, pts = _make_dust_fA_valid_points_generator(it, min_Rv, max_Rv, Rv_B)
+        print(
+            """number of initially requested points = {0:d}
+              number of valid points = {1:d} (based on restrictions in R(V)
+                 versus f_A plane)
+              """.format(
+                niter, npts
+            )
+        )
+        if npts == 0:
+            raise AttributeError("No valid points")
+        dust_points = list(pts)
+    else:
+        dust_points = [(float(ak), float(rk)) for ak, rk in np.nditer(np.ix_(avs, rvs))]
+        npts = len(dust_points)
+
+    N0 = len(g0.grid)
+    N = N0 * npts
+    if chunksize <= 0:
+        chunksize = npts
+        print("Generating a final grid of {0:d} points".format(N))
+    else:
+        print(
+            "Generating a final grid of {0:d} points in {1:d} pieces".format(
+                N, int(float(npts) / chunksize + 1.0)
+            )
+        )
+
+    if isinstance(filter_names[0], str):
+        flist = phot.load_filters(
+            filter_names, interp=True, lamb=g0.lamb, filterLib=filterLib
+        )
+        out_filter_names = filter_names
+    else:
+        flist = phot.load_Integrationfilters(filter_names, interp=True, lamb=g0.lamb)
+        out_filter_names = [fk.name for fk in filter_names]
+
+    _lamb, sed_matrix = _filter_integration_matrix(g0.lamb, flist, absFlux=True)
+    prop_matrices = []
+    if add_props is not None:
+        nameformat = add_props.pop("nameformat", "{0:s}") + "_wd"
+        prop_filternames = add_props.pop("filternames", None)
+        prop_filters = add_props.pop("filters", None)
+        # The original function forwards filterLib for named filters.
+        if prop_filternames is not None:
+            prop_flist = phot.load_filters(
+                prop_filternames, interp=True, lamb=g0.lamb, filterLib=filterLib
+            )
+            _, prop_matrix = _filter_integration_matrix(
+                g0.lamb, prop_flist, absFlux=True
+            )
+            prop_matrices.append((prop_filternames, prop_matrix, nameformat))
+        if prop_filters is not None:
+            prop_flist = phot.load_Integrationfilters(
+                prop_filters, interp=True, lamb=g0.lamb
+            )
+            _, prop_matrix = _filter_integration_matrix(
+                g0.lamb, prop_flist, absFlux=True
+            )
+            prop_matrices.append(
+                ([fk.name for fk in prop_filters], prop_matrix, nameformat)
+            )
+        if add_props:
+            raise NotImplementedError(
+                "make_extinguished_grid_fast only supports filternames/filters spectral properties"
+            )
+
+    base_seds = np.asarray(g0.seds)
+    keys = list(g0.keys())
+    base_cols = {key: np.asarray(g0.grid[key]) for key in keys}
+    base_distances = np.asarray(g0.grid["distance"].data)
+
+    for chunk_points in helpers.chunks(dust_points, chunksize):
+        chunk_points = list(chunk_points)
+        chunk_npts = len(chunk_points)
+        chunk_N = N0 * chunk_npts
+
+        cols = {
+            "Av": np.zeros(chunk_N, dtype=float),
+            "Rv": np.zeros(chunk_N, dtype=float),
+        }
+        if with_fA:
+            cols["Rv_A"] = np.zeros(chunk_N, dtype=float)
+            cols["f_A"] = np.zeros(chunk_N, dtype=float)
+        for key in keys:
+            cols[key] = np.tile(base_cols[key], chunk_npts)
+
+        _seds = np.zeros((chunk_N, len(flist)), dtype=float)
+        prop_seds_by_name = {}
+
+        with profile_stage("physics: dust SED generation"):
+            for count, pt in enumerate(tqdm(chunk_points, desc="SED grid")):
+                k1 = N0 * count
+                k2 = N0 * (count + 1)
+                f_A = 1.0
+                if with_fA:
+                    Av, Rv, f_A = pt
+                    Rv_A = extLaw.get_Rv_A(Rv, f_A)
+                    ext_curve = np.exp(
+                        -1.0 * extLaw.function(g0.lamb[:], Av=Av, Rv=Rv, f_A=f_A)
+                    )
+                    cols["f_A"][k1:k2] = f_A
+                    cols["Rv_A"][k1:k2] = Rv_A
+                else:
+                    Av, Rv = pt
+                    ext_curve = np.exp(
+                        -1.0 * extLaw.function(g0.lamb[:], Av=Av, Rv=Rv)
+                    )
+
+                attenuated_seds = base_seds * ext_curve[None, :]
+                temp_seds = attenuated_seds @ sed_matrix
+                _seds[k1:k2] = temp_seds
+                cols["Av"][k1:k2] = Av
+                cols["Rv"][k1:k2] = Rv
+
+                for prop_names, prop_matrix, nameformat in prop_matrices:
+                    prop_values = attenuated_seds @ prop_matrix
+                    log_prop_values = _log_sed_columns(prop_values)
+                    for i, fk in enumerate(prop_names):
+                        colname = "log" + nameformat.format(fk)
+                        prop_seds_by_name.setdefault(
+                            colname, np.zeros(chunk_N, dtype=float)
+                        )[k1:k2] = log_prop_values[:, i]
+
+                dust_prior_weight = compute_av_rv_fA_prior_weights(
+                    Av,
+                    Rv,
+                    f_A,
+                    base_distances,
+                    av_prior_model=av_prior_model,
+                    rv_prior_model=rv_prior_model,
+                    fA_prior_model=fA_prior_model,
+                )
+                cols["weight"][k1:k2] *= dust_prior_weight
+                cols["prior_weight"][k1:k2] *= dust_prior_weight
+
+        cols.update(prop_seds_by_name)
+
+        av_grid_weights = compute_grid_weights(avs)
+        for cav, cav_gweight in zip(avs, av_grid_weights):
+            gvals = cols["Av"] == cav
+            cols["weight"][gvals] *= cav_gweight
+            cols["grid_weight"][gvals] *= cav_gweight
+
+        rv_grid_weights = compute_grid_weights(rvs)
+        for rav, rav_gweight in zip(rvs, rv_grid_weights):
+            gvals = cols["Rv"] == rav
+            cols["weight"][gvals] *= rav_gweight
+            cols["grid_weight"][gvals] *= rav_gweight
+
+        if with_fA:
+            fA_grid_weights = compute_grid_weights(fAs)
+            for cfA, cfA_gweight in zip(fAs, fA_grid_weights):
+                gvals = cols["f_A"] == cfA
+                cols["weight"][gvals] *= cfA_gweight
+                cols["grid_weight"][gvals] *= cfA_gweight
+
+        g = SEDGrid(_lamb, seds=_seds, grid=Table(cols), backend="memory")
+        g.header["filters"] = " ".join(out_filter_names)
         yield g
 
 

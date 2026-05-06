@@ -93,6 +93,15 @@ class pdf2d:
         # get PDF bin associated with each grid val
         pdf_bin_num_p1 = np.digitize(tgridvals_p1, self.bin_edges_p1)
         pdf_bin_num_p2 = np.digitize(tgridvals_p2, self.bin_edges_p2)
+        pdf_bin_index_p1 = pdf_bin_num_p1.astype(np.int64) - 1
+        pdf_bin_index_p2 = pdf_bin_num_p2.astype(np.int64) - 1
+        pdf_bin_valid = (
+            (pdf_bin_index_p1 >= 0)
+            & (pdf_bin_index_p1 < self.nbins_p1)
+            & (pdf_bin_index_p2 >= 0)
+            & (pdf_bin_index_p2 < self.nbins_p2)
+        )
+        pdf_flat_index = pdf_bin_index_p1 * self.nbins_p2 + pdf_bin_index_p2
 
         # array to hold indices for each bin
         pdf_bin_indxs = [
@@ -118,6 +127,8 @@ class pdf2d:
             self.bin_edges_p2 = np.power(10.0, self.bin_edges_p2)
 
         self.pdf_bin_indxs = pdf_bin_indxs
+        self.pdf_flat_index = pdf_flat_index
+        self.pdf_bin_valid = pdf_bin_valid
 
     def gen2d(self, gindxs, weights):
         """
@@ -137,12 +148,12 @@ class pdf2d:
             2D `float` array giving the bin pPDF values
         """
 
-        _tgrid = np.zeros(self.n_gridvals)
-        _tgrid[gindxs] = weights
-        _vals_2d = np.zeros((self.nbins_p1, self.nbins_p2))
-        for i in range(self.nbins_p1):
-            for j in range(self.nbins_p2):
-                if len(self.pdf_bin_indxs[i][j]) > 0:
-                    _vals_2d[i, j] = np.sum(_tgrid[self.pdf_bin_indxs[i][j]])
+        gindxs = np.asarray(gindxs, dtype=np.int64)
+        valid = self.pdf_bin_valid[gindxs]
+        flat_vals = np.bincount(
+            self.pdf_flat_index[gindxs[valid]],
+            weights=np.asarray(weights)[valid],
+            minlength=self.nbins_p1 * self.nbins_p2,
+        )
 
-        return _vals_2d
+        return flat_vals.reshape(self.nbins_p1, self.nbins_p2)

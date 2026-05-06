@@ -9,6 +9,7 @@ import beast.observationmodel.noisemodel.generic_noisemodel as noisemodel
 from beast.physicsmodel.grid import SEDGrid
 from beast.tools import beast_settings
 from beast.tools.run.helper_functions import parallel_wrapper, get_modelsubgridfiles
+from beast.tools.profiling import profile_stage
 
 
 def create_obsmodel(
@@ -47,6 +48,23 @@ def create_obsmodel(
 
     """
 
+    with profile_stage("observation/noise model creation", log_event=True):
+        return _create_obsmodel_impl(
+            beast_settings_info,
+            use_sd=use_sd,
+            nsubs=nsubs,
+            nprocs=nprocs,
+            subset=subset,
+        )
+
+
+def _create_obsmodel_impl(
+    beast_settings_info,
+    use_sd=True,
+    nsubs=1,
+    nprocs=1,
+    subset=[None, None],
+):
     # process beast settings info
     if isinstance(beast_settings_info, str):
         settings = beast_settings.beast_settings(beast_settings_info)

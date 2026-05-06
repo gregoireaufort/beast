@@ -91,6 +91,7 @@ class pdf1d:
             # array to hold indices for each bin
             # (like the IDL version returned by the histogram function)
             pdf_bin_indxs = []
+            pdf_bin_index = pdf_bin_num.astype(np.int64) - 1
 
             used_nindxs = 0
             for i in range(nbins):
@@ -108,6 +109,7 @@ class pdf1d:
                 self.bin_edges = np.power(10.0, self.bin_edges)
 
             self.pdf_bin_indxs = pdf_bin_indxs
+            self.pdf_bin_index = pdf_bin_index
 
             if used_nindxs != self.n_indxs:
                 print(used_nindxs, self.n_indxs)
@@ -138,11 +140,9 @@ class pdf1d:
         if self.bad:
             return (self.bin_vals, np.zeros((self.nbins)))
         else:
-            _tgrid = np.zeros(self.n_gridvals)
-            _tgrid[gindxs] = weights
-            _vals_1d = np.zeros(self.nbins)
-            for i in range(self.nbins):
-                if len(self.pdf_bin_indxs[i]) > 0:
-                    _vals_1d[i] = np.sum(_tgrid[self.pdf_bin_indxs[i]])
-
+            _vals_1d = np.bincount(
+                self.pdf_bin_index[np.asarray(gindxs, dtype=np.int64)],
+                weights=weights,
+                minlength=self.nbins,
+            )
             return (self.bin_vals, _vals_1d)

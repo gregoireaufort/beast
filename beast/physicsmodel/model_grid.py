@@ -12,6 +12,7 @@ from beast.physicsmodel.grid_and_prior_weights import (
     compute_distance_age_mass_metallicity_weights,
 )
 from beast.tools.beast_info import add_to_beast_info_file
+from beast.tools.profiling import profile_stage
 
 __all__ = [
     "make_evoltrack_table",
@@ -87,7 +88,10 @@ def make_evoltrack_table(
 
         if isinstance(oet, isochrone.Isochrone):
             logtmin, logtmax, dlogt = age_info
-            t = oet._get_t_isochrones(max(5.0, logtmin), min(10.13, logtmax), dlogt, z)
+            with profile_stage("physics: isochrone retrieval"):
+                t = oet._get_t_isochrones(
+                    max(5.0, logtmin), min(10.13, logtmax), dlogt, z
+                )
             t.header["NAME"] = "{0} Isochrones".format(
                 "_".join(et_fname.split("_")[:-1])
             )
@@ -96,20 +100,24 @@ def make_evoltrack_table(
 
             if not os.path.isdir(project):
                 os.makedirs(project)
-            t.write(et_fname)
+            with profile_stage("physics: isochrone table writing"):
+                t.write(et_fname)
             # maybe needed as ezIsoch is a proxy for a Table
             # maybe we can just use a table????
-            oet = ezIsoch(et_fname)
+            with profile_stage("physics: isochrone table loading"):
+                oet = ezIsoch(et_fname)
         elif isinstance(oet, evoltracks.EvolTracks):
-            tab = oet.get_evoltracks(
-                mass_info,
-                z,
-                condense=condense,
-                logT_delta=condense_logT_delta,
-                logL_delta=condense_logL_delta,
-            )
+            with profile_stage("physics: isochrone retrieval"):
+                tab = oet.get_evoltracks(
+                    mass_info,
+                    z,
+                    condense=condense,
+                    logT_delta=condense_logT_delta,
+                    logL_delta=condense_logL_delta,
+                )
             print(tab.header["NAME"])
-            tab.write(et_fname, overwrite=True)
+            with profile_stage("physics: isochrone table writing"):
+                tab.write(et_fname, overwrite=True)
             info = {"project": project, "logm_input": mass_info, "z_input": z}
         else:
             print(f"Type {type(oet)} of evolutionary track not supported")
@@ -117,12 +125,14 @@ def make_evoltrack_table(
         # save info to the beast info file
         if info_fname is None:
             info_fname = f"{project}/{project}_beast_info.asdf"
-        add_to_beast_info_file(info_fname, info)
+        with profile_stage("physics: info writing"):
+            add_to_beast_info_file(info_fname, info)
 
     else:
         # read in the isochrone data from the file
         #   not sure why this is needed, but reproduces previous ezpipe method
-        oet = ezIsoch(et_fname)
+        with profile_stage("physics: isochrone table loading"):
+            oet = ezIsoch(et_fname)
 
     # gmetrics = oet.grid_metrics()
     # for ckey in gmetrics.keys():
@@ -220,9 +230,10 @@ def make_spectral_grid(
         # make the spectral grid
         if verbose:
             print("Make spectra")
-        g = creategrid.gen_spectral_grid_from_stellib_given_points(
-            osl, oet.data, bounds=bounds
-        )
+        with profile_stage("physics: stellar spectral interpolation"):
+            g = creategrid.gen_spectral_grid_from_stellib_given_points(
+                osl, oet.data, bounds=bounds
+            )
 
         # Construct the distances array. Turn single value into
         # 1-element list if single distance is given.
@@ -259,40 +270,46 @@ def make_spectral_grid(
         # for larger grids.
         def apply_distance_and_spectral_props(g):
             # distance
-            g = creategrid.apply_distance_grid(g, distances, redshift=redshift)
+            with profile_stage("physics: distance expansion"):
+                g = creategrid.apply_distance_grid(g, distances, redshift=redshift)
 
             # spectral props
             if add_spectral_properties_kwargs is not None:
-                g = creategrid.add_spectral_properties(
-                    g,
-                    nameformat=nameformat,
-                    filterLib=filterLib,
-                    **add_spectral_properties_kwargs,
-                )
+                with profile_stage("physics: spectral property extraction"):
+                    g = creategrid.add_spectral_properties(
+                        g,
+                        nameformat=nameformat,
+                        filterLib=filterLib,
+                        **add_spectral_properties_kwargs,
+                    )
 
             # extinction
             if extLaw is not None:
-                ext_law_range_A = 1e4 / np.array(extLaw.x_range)
-                valid_lambda = np.where(
-                    (g.lamb > np.min(ext_law_range_A))
-                    & (g.lamb < np.max(ext_law_range_A))
-                )[0]
+                with profile_stage("physics: extinction wavelength trimming"):
+                    ext_law_range_A = 1e4 / np.array(extLaw.x_range)
+                    valid_lambda = np.where(
+                        (g.lamb > np.min(ext_law_range_A))
+                        & (g.lamb < np.max(ext_law_range_A))
+                    )[0]
 
-                g.lamb = g.lamb[valid_lambda]
-                g.seds = g.seds[:, valid_lambda]
+                    g.lamb = g.lamb[valid_lambda]
+                    g.seds = g.seds[:, valid_lambda]
 
             return g
 
         # Perform the extensions defined above and Write to disk
         if hasattr(g, "write"):
             g = apply_distance_and_spectral_props(g)
-            g.write(spec_fname)
+            with profile_stage("physics: spectral grid writing"):
+                g.write(spec_fname)
         else:
             for gk in g:
                 gk = apply_distance_and_spectral_props(gk)
-                gk.write(spec_fname, append=True)
+                with profile_stage("physics: spectral grid writing"):
+                    gk.write(spec_fname, append=True)
 
-    g = SpectralGrid(spec_fname, backend="memory")
+    with profile_stage("physics: spectral grid loading"):
+        g = SpectralGrid(spec_fname, backend="memory")
 
     return (spec_fname, g)
 
@@ -353,21 +370,24 @@ def add_stellar_priors(
         if verbose:
             print("Make Prior Weights")
 
-        compute_distance_age_mass_metallicity_weights(
-            specgrid.grid,
-            distance_prior_model=distance_prior_model,
-            age_prior_model=age_prior_model,
-            mass_prior_model=mass_prior_model,
-            met_prior_model=met_prior_model,
-            **kwargs,
-        )
+        with profile_stage("physics: stellar prior weighting"):
+            compute_distance_age_mass_metallicity_weights(
+                specgrid.grid,
+                distance_prior_model=distance_prior_model,
+                age_prior_model=age_prior_model,
+                mass_prior_model=mass_prior_model,
+                met_prior_model=met_prior_model,
+                **kwargs,
+            )
 
         # write to disk
         if hasattr(specgrid, "write"):
-            specgrid.write(priors_fname)
+            with profile_stage("physics: prior grid writing"):
+                specgrid.write(priors_fname)
         else:
             for gk in specgrid:
-                gk.write(priors_fname, append=True)
+                with profile_stage("physics: prior grid writing"):
+                    gk.write(priors_fname, append=True)
 
     # save info to the beast info file
     info = {
@@ -378,10 +398,12 @@ def add_stellar_priors(
     }
     if info_fname is None:
         info_fname = f"{project}/{project}_beast_info.asdf"
-    add_to_beast_info_file(info_fname, info)
+    with profile_stage("physics: info writing"):
+        add_to_beast_info_file(info_fname, info)
 
     # read in spectralgrid from file (possible not needed, need to check)
-    g = SpectralGrid(priors_fname, backend="memory")
+    with profile_stage("physics: prior grid loading"):
+        g = SpectralGrid(priors_fname, backend="memory")
 
     return (priors_fname, g)
 
@@ -399,6 +421,7 @@ def make_extinguished_sed_grid(
     extLaw=None,
     add_spectral_properties_kwargs=None,
     absflux_cov=False,
+    fast_sed_grid=False,
     verbose=True,
     seds_fname=None,
     filterLib=None,
@@ -449,6 +472,9 @@ def make_extinguished_sed_grid(
         set to calculate the absflux covariance matrices for each model
         (can be very slow!!!  But it is the right thing to do)
 
+    fast_sed_grid: boolean
+        use the experimental vectorized SED-grid generation path
+
     seds_fname: str
         full filename to save the sed grid into
 
@@ -497,40 +523,48 @@ def make_extinguished_sed_grid(
         if verbose:
             print("Make SEDS")
 
+        make_extinguished_grid_func = creategrid.make_extinguished_grid
+        if fast_sed_grid:
+            make_extinguished_grid_func = creategrid.make_extinguished_grid_fast
+
         if fA is not None:
-            g = creategrid.make_extinguished_grid(
-                specgrid,
-                filters,
-                extLaw,
-                avs,
-                rvs,
-                fAs,
-                av_prior_model=av_prior_model,
-                rv_prior_model=rv_prior_model,
-                fA_prior_model=fA_prior_model,
-                add_spectral_properties_kwargs=add_spectral_properties_kwargs,
-                absflux_cov=absflux_cov,
-                filterLib=filterLib,
-            )
+            with profile_stage("physics: dust SED generation"):
+                g = make_extinguished_grid_func(
+                    specgrid,
+                    filters,
+                    extLaw,
+                    avs,
+                    rvs,
+                    fAs,
+                    av_prior_model=av_prior_model,
+                    rv_prior_model=rv_prior_model,
+                    fA_prior_model=fA_prior_model,
+                    add_spectral_properties_kwargs=add_spectral_properties_kwargs,
+                    absflux_cov=absflux_cov,
+                    filterLib=filterLib,
+                )
         else:
-            g = creategrid.make_extinguished_grid(
-                specgrid,
-                filters,
-                extLaw,
-                avs,
-                rvs,
-                av_prior_model=av_prior_model,
-                rv_prior_model=rv_prior_model,
-                add_spectral_properties_kwargs=add_spectral_properties_kwargs,
-                absflux_cov=absflux_cov,
-            )
+            with profile_stage("physics: dust SED generation"):
+                g = make_extinguished_grid_func(
+                    specgrid,
+                    filters,
+                    extLaw,
+                    avs,
+                    rvs,
+                    av_prior_model=av_prior_model,
+                    rv_prior_model=rv_prior_model,
+                    add_spectral_properties_kwargs=add_spectral_properties_kwargs,
+                    absflux_cov=absflux_cov,
+                )
 
         # write to disk
         if hasattr(g, "write"):
-            g.write(seds_fname)
+            with profile_stage("physics: SED grid writing"):
+                g.write(seds_fname)
         else:
             for gk in g:
-                gk.write(seds_fname, append=True)
+                with profile_stage("physics: SED grid writing"):
+                    gk.write(seds_fname, append=True)
 
     # save info to the beast info file
     info = {
@@ -546,8 +580,10 @@ def make_extinguished_sed_grid(
     }
     if info_fname is None:
         info_fname = f"{project}/{project}_beast_info.asdf"
-    add_to_beast_info_file(info_fname, info)
+    with profile_stage("physics: info writing"):
+        add_to_beast_info_file(info_fname, info)
 
-    g = SEDGrid(seds_fname, backend="memory")
+    with profile_stage("physics: SED grid loading"):
+        g = SEDGrid(seds_fname, backend="memory")
 
     return (seds_fname, g)

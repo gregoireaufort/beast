@@ -12,6 +12,23 @@ import beast.observationmodel.noisemodel.generic_noisemodel as noisemodel
 from beast.tools import beast_settings, subgridding_tools
 from beast.tools.run import create_filenames
 from beast.tools.run.helper_functions import parallel_wrapper
+from beast.tools.profiling import profile_stage, profile_summary
+
+
+def _env_bool(name):
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _resolve_fit_bool(settings, explicit_value, setting_name, env_name, default=True):
+    if explicit_value is not None:
+        return bool(explicit_value)
+    env_value = _env_bool(env_name)
+    if env_value is not None:
+        return env_value
+    return bool(getattr(settings, setting_name, default))
 
 
 def run_fitting(
@@ -24,6 +41,10 @@ def run_fitting(
     pdf2d_param_list=None,
     pdf_max_nbins=200,
     resume=False,
+    save_pdf1d=None,
+    save_pdf2d=None,
+    save_lnp=None,
+    compute_percentiles=None,
 ):
     """
     Run the fitting.  If nsubs > 1, this will find existing subgrids.
@@ -69,6 +90,14 @@ def run_fitting(
     resume : boolean (default=False)
         choose whether to resume existing run or start over
 
+    save_pdf1d, save_pdf2d, save_lnp : boolean or None
+        Output controls for the 1D PDFs, 2D PDFs, and sparse likelihoods.
+        None uses settings attributes or environment variables if present.
+
+    compute_percentiles : boolean or None
+        If False, skip percentile columns and the 1D PDF work needed only for
+        percentiles. Defaults preserve the standard BEAST outputs.
+
     """
 
     # process beast settings info
@@ -84,17 +113,36 @@ def run_fitting(
     # keep track of time
     start_time = time.perf_counter()
 
+    fit_save_pdf1d = _resolve_fit_bool(
+        settings, save_pdf1d, "fit_save_pdf1d", "BEAST_FIT_SAVE_PDF1D", True
+    )
+    fit_save_pdf2d = _resolve_fit_bool(
+        settings, save_pdf2d, "fit_save_pdf2d", "BEAST_FIT_SAVE_PDF2D", True
+    )
+    fit_save_lnp = _resolve_fit_bool(
+        settings, save_lnp, "fit_save_lnp", "BEAST_FIT_SAVE_LNP", True
+    )
+    fit_compute_percentiles = _resolve_fit_bool(
+        settings,
+        compute_percentiles,
+        "fit_compute_percentiles",
+        "BEAST_FIT_COMPUTE_PERCENTILES",
+        True,
+    )
+    settings.fit_compute_percentiles = fit_compute_percentiles
+
     # --------------------
     # make lists of file names
     # --------------------
 
-    file_dict = create_filenames.create_filenames(
-        settings,
-        use_sd=use_sd,
-        nsubs=nsubs,
-        choose_sd_sub=choose_sd_sub,
-        choose_subgrid=choose_subgrid,
-    )
+    with profile_stage("loading physics/noise grids", detail="create fitting filenames"):
+        file_dict = create_filenames.create_filenames(
+            settings,
+            use_sd=use_sd,
+            nsubs=nsubs,
+            choose_sd_sub=choose_sd_sub,
+            choose_subgrid=choose_subgrid,
+        )
 
     # input files
     photometry_files = file_dict["photometry_files"]
@@ -106,10 +154,15 @@ def run_fitting(
     # output files
     stats_files = file_dict["stats_files"]
     pdf_files = file_dict["pdf_files"]
+    if not fit_save_pdf1d:
+        pdf_files = [None for i in range(len(pdf_files))]
     pdf2d_files = file_dict["pdf2d_files"]
-    if pdf2d_param_list is None:
+    if (pdf2d_param_list is None) or (not fit_save_pdf2d):
         pdf2d_files = [None for i in range(len(pdf2d_files))]
+        pdf2d_param_list = None
     lnp_files = file_dict["lnp_files"]
+    if not fit_save_lnp:
+        lnp_files = [None for i in range(len(lnp_files))]
 
     # total number of files
     n_files = len(photometry_files)
@@ -149,9 +202,10 @@ def run_fitting(
 
                 # create the grid info dictionary
                 print("creating grid_info_dict for " + gridpickle_files[i])
-                grid_info_dict = subgridding_tools.reduce_grid_info(
-                    modelsedgrid_trim_list, noise_trim_list, nprocs=nprocs
-                )
+                with profile_stage("loading physics/noise grids", detail="reduce grid info"):
+                    grid_info_dict = subgridding_tools.reduce_grid_info(
+                        modelsedgrid_trim_list, noise_trim_list, nprocs=nprocs
+                    )
                 # save it
                 with open(gridpickle_files[i], "wb") as p:
                     pickle.dump(grid_info_dict, p)
@@ -206,6 +260,7 @@ def run_fitting(
     # run the fitting (via parallel wrapper)
 
     parallel_wrapper(fit_submodel, input_list, nprocs=nprocs)
+    profile_summary("BEAST fitting profile summary", reset=True)
 
     # see how long it took!
     new_time = time.perf_counter()
@@ -276,24 +331,25 @@ def fit_submodel(
 
     """
 
-    # read in the photometry catalog
-    obsdata = Observations(
-        photometry_file, settings.filters, obs_colnames=settings.obs_colnames
-    )
+    with profile_stage("loading physics/noise grids", detail=modelsedgrid_file, log_event=True):
+        # read in the photometry catalog
+        obsdata = Observations(
+            photometry_file, settings.filters, obs_colnames=settings.obs_colnames
+        )
 
-    # check if it's a subgrid run by looking in the file name
-    if "gridsub" in modelsedgrid_file:
-        subgrid_run = True
-        print("loading grid_info_dict from " + grid_info_file)
-        with open(grid_info_file, "rb") as p:
-            grid_info_dict = pickle.loads(p.read())
-    else:
-        subgrid_run = False
-        grid_info_dict = None
+        # check if it's a subgrid run by looking in the file name
+        if "gridsub" in modelsedgrid_file:
+            subgrid_run = True
+            print("loading grid_info_dict from " + grid_info_file)
+            with open(grid_info_file, "rb") as p:
+                grid_info_dict = pickle.loads(p.read())
+        else:
+            subgrid_run = False
+            grid_info_dict = None
 
-    # load the SED grid and noise model
-    modelsedgrid = SEDGrid(modelsedgrid_file)
-    noisemodel_vals = noisemodel.get_noisemodelcat(noise_file)
+        # load the SED grid and noise model
+        modelsedgrid = SEDGrid(modelsedgrid_file)
+        noisemodel_vals = noisemodel.get_noisemodelcat(noise_file)
 
     # optional fitting settings for batched / top-k path
     # defaults preserve the original BEAST behavior
@@ -307,6 +363,7 @@ def fit_submodel(
     fit_topk_kmin = getattr(settings, "fit_topk_kmin", 32)
     fit_topk_kmax = getattr(settings, "fit_topk_kmax", 2048)
     fit_topk_kquantile = getattr(settings, "fit_topk_kquantile", 0.95)
+    fit_compute_percentiles = getattr(settings, "fit_compute_percentiles", True)
 
     if subgrid_run:
         fit.summary_table_memory(
@@ -334,6 +391,7 @@ def fit_submodel(
             fit_topk_kmin=fit_topk_kmin,
             fit_topk_kmax=fit_topk_kmax,
             fit_topk_kquantile=fit_topk_kquantile,
+            compute_percentiles=fit_compute_percentiles,
         )
         print("Done fitting on grid " + modelsedgrid_file)
 
@@ -362,6 +420,7 @@ def fit_submodel(
             fit_topk_kmin=fit_topk_kmin,
             fit_topk_kmax=fit_topk_kmax,
             fit_topk_kquantile=fit_topk_kquantile,
+            compute_percentiles=fit_compute_percentiles,
         )
         print("Done fitting on grid " + modelsedgrid_file)
 
@@ -419,6 +478,26 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument(
         "-r", "--resume", help="resume a fitting run", action="store_true"
     )
+    parser.add_argument(
+        "--no_pdf1d",
+        help="skip writing 1D PDF output",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no_pdf2d",
+        help="skip writing 2D PDF output",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no_lnp",
+        help="skip writing sparse likelihood output",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no_percentiles",
+        help="skip percentile columns and their 1D PDF computations",
+        action="store_true",
+    )
 
     args = parser.parse_args()
 
@@ -435,4 +514,8 @@ if __name__ == "__main__":  # pragma: no cover
         pdf2d_param_list=args.pdf2d_param_list,
         pdf_max_nbins=args.pdf_max_nbins,
         resume=args.resume,
+        save_pdf1d=not args.no_pdf1d,
+        save_pdf2d=not args.no_pdf2d,
+        save_lnp=not args.no_lnp,
+        compute_percentiles=not args.no_percentiles,
     )

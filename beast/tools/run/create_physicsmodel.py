@@ -16,7 +16,9 @@ from beast.physicsmodel.model_grid import (
     make_extinguished_sed_grid,
 )
 from beast.physicsmodel.grid import SpectralGrid
+from beast.physicsmodel.stars import isochrone
 from beast.tools.run.helper_functions import parallel_wrapper
+from beast.tools.profiling import profile_stage
 
 # from beast.physicsmodel.stars.isochrone import ezIsoch
 from beast.tools import beast_settings, subgridding_tools
@@ -46,6 +48,11 @@ def create_physicsmodel(beast_settings_info, nsubs=1, nprocs=1, subset=[None, No
 
     """
 
+    with profile_stage("physics model grid creation", log_event=True):
+        return _create_physicsmodel_impl(beast_settings_info, nsubs, nprocs, subset)
+
+
+def _create_physicsmodel_impl(beast_settings_info, nsubs=1, nprocs=1, subset=[None, None]):
     # process beast settings info
     if isinstance(beast_settings_info, str):
         settings = beast_settings.beast_settings(beast_settings_info)
@@ -54,6 +61,19 @@ def create_physicsmodel(beast_settings_info, nsubs=1, nprocs=1, subset=[None, No
     else:
         raise TypeError(
             "beast_settings_info must be string or beast.tools.beast_settings.beast_settings instance"
+        )
+
+    padova_mode = os.environ.get("BEAST_PADOVA_MODE", "").lower()
+    if padova_mode in {"local", "offline", "offline_strict"} and isinstance(
+        settings.oiso, isochrone.PadovaWeb
+    ) and not isinstance(settings.oiso, isochrone.PadovaLocal):
+        settings.oiso = isochrone.PadovaLocal(
+            database_path=getattr(settings, "padova_database_path", None),
+            offline_strict=padova_mode in {"offline", "offline_strict"},
+            Zref=settings.oiso.Zref,
+            modeltype=settings.oiso.modeltype,
+            filterPMS=settings.oiso.filterPMS,
+            filterBad=settings.oiso.filterBad,
         )
 
     # filename for the SED grid
@@ -99,6 +119,10 @@ def create_physicsmodel(beast_settings_info, nsubs=1, nprocs=1, subset=[None, No
         extra_kwargs = settings.add_spectral_properties_kwargs
     else:
         extra_kwargs = None
+    fast_sed_grid = bool(
+        getattr(settings, "fast_sed_grid", False)
+        or os.environ.get("BEAST_FAST_SED_GRID", "").lower() in ("1", "true", "yes")
+    )
 
     if hasattr(settings, "velocity"):
         redshift = (settings.velocity / const.c).decompose().value
@@ -149,6 +173,7 @@ def create_physicsmodel(beast_settings_info, nsubs=1, nprocs=1, subset=[None, No
             fA_prior_model=settings.fA_prior_model,
             spec_fname=modelsedgrid_filename,
             add_spectral_properties_kwargs=extra_kwargs,
+            fast_sed_grid=fast_sed_grid,
         )
 
     # --------------------
@@ -185,6 +210,7 @@ def create_physicsmodel(beast_settings_info, nsubs=1, nprocs=1, subset=[None, No
                 av_prior_model=settings.av_prior_model,
                 fA_prior_model=settings.fA_prior_model,
                 add_spectral_properties_kwargs=extra_kwargs,
+                fast_sed_grid=fast_sed_grid,
                 seds_fname=sub_seds_fname,
             )
 

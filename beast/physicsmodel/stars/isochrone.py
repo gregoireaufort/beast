@@ -6,6 +6,7 @@ sources.
 """
 
 import copy
+import os
 import numpy as np
 from numpy import interp
 from numpy import log10
@@ -20,9 +21,22 @@ from numpy.lib import recfunctions
 # from beast.external.eztables.table import recfunctions
 from beast.config import __ROOT__
 from beast.physicsmodel.stars.ezpadova import parsec
+from beast.physicsmodel.stars.padova_local import (
+    MissingIsochroneError,
+    PadovaLocalDatabase,
+    PadovaQuerySpec,
+)
 from beast.physicsmodel.stars.ezmist import mist
 
-__all__ = ["Isochrone", "padova2010", "pegase", "ezIsoch", "PadovaWeb", "MISTWeb"]
+__all__ = [
+    "Isochrone",
+    "padova2010",
+    "pegase",
+    "ezIsoch",
+    "PadovaWeb",
+    "PadovaLocal",
+    "MISTWeb",
+]
 
 
 class Isochrone(object):
@@ -765,6 +779,76 @@ class PadovaWeb(Isochrone):
 
         # Handle Z if it's a list of numbers, getting isochrones for each
         # With ~~~#~~~ RECURSIVE RECURSION ~~~#~~~
+        else:
+            iso_table = self._get_t_isochrones(logtmin, logtmax, dlogt, Z[0])
+            header = copy.copy(iso_table.header)
+            if len(Z) > 1:
+                for Zk in Z[1:]:
+                    iso_table = astropy.table.vstack(
+                        [iso_table, self._get_t_isochrones(logtmin, logtmax, dlogt, Zk)]
+                    )
+            iso_table.header = header
+
+        return iso_table
+
+
+class PadovaLocal(PadovaWeb):
+    """Offline Padova/PARSEC isochrone backend backed by local query results."""
+
+    def __init__(self, database_path=None, offline_strict=True, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if database_path is None:
+            database_path = os.environ.get("BEAST_PADOVA_DB")
+        if database_path is None:
+            raise ValueError(
+                "PadovaLocal requires database_path or BEAST_PADOVA_DB to be set"
+            )
+        self.database = PadovaLocalDatabase(database_path)
+        self.offline_strict = offline_strict
+        self.name = "Local Padova CMD isochrones"
+
+    def _query_spec(self, logtmin, logtmax, dlogt, z):
+        return PadovaQuerySpec.for_beast_t_isochrones(
+            logtmin,
+            logtmax,
+            dlogt,
+            z,
+            modeltype=self.modeltype,
+            filterPMS=self.filterPMS,
+            filterBad=self.filterBad,
+        )
+
+    def _read_raw_t_isochrones(self, logtmin, logtmax, dlogt, z):
+        spec = self._query_spec(logtmin, logtmax, dlogt, z)
+        try:
+            return self.database.read_raw_table(spec)
+        except MissingIsochroneError:
+            if self.offline_strict:
+                raise
+            raw_table = parsec.get_t_isochrones(
+                max(6.0, logtmin),
+                min(10.13, logtmax),
+                dlogt,
+                z,
+                model=self.modeltype,
+            )
+            self.database.write_raw_table(
+                spec, raw_table, metadata={"source": "PadovaWeb fallback"}
+            )
+            return raw_table
+
+    def _get_t_isochrones(self, logtmin, logtmax, dlogt, Z=0.0152):
+        if not hasattr(Z, "__iter__"):
+            iso_table = self._read_raw_t_isochrones(logtmin, logtmax, dlogt, Z)
+            iso_table.header = {}
+            iso_table.header["NAME"] = "PadovaCMD Isochrones: " + self.modeltype
+            if "Z" not in iso_table.colnames:
+                iso_table.add_column("Z", np.ones(len(iso_table)) * Z)
+
+            iso_table = self._clean_cols(iso_table)
+            iso_table = self._filter_iso_points(
+                iso_table, filterPMS=self.filterPMS, filterBad=self.filterBad
+            )
         else:
             iso_table = self._get_t_isochrones(logtmin, logtmax, dlogt, Z[0])
             header = copy.copy(iso_table.header)
