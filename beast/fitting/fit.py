@@ -35,6 +35,7 @@ __all__ = [
     "summary_table_memory",
     "Q_all_memory",
     "q_all_memory_batched_kernel",
+    "q_all_memory_batched_blocked_kernel",
     "IAU_names_and_extra_info",
     "save_stats",
     "save_pdf1d",
@@ -778,6 +779,194 @@ def q_all_memory_batched_kernel(
     }
 
 
+def q_all_memory_batched_blocked_kernel(
+    Y_batch,
+    model_seds_with_bias,
+    log_prior_weights,
+    q_param_arrays,
+    pdf1d_bin_indices,
+    pdf1d_bin_values,
+    pdf2d_flat_indices=(),
+    pdf2d_shapes=(),
+    ast_ivar=None,
+    threshold=-40.0,
+    p=(16.0, 50.0, 84.0),
+    compute_percentiles=True,
+    model_block_size=250000,
+    backend="numpy",
+    retain_sparse=True,
+):
+    """Memory-bounded diagonal batched fitting kernel.
+
+    This is an exact dense-posterior kernel for the diagonal-noise case, but it
+    streams over model blocks instead of materializing full ``B x M`` posterior
+    arrays. It performs two passes over the model grid: the first pass finds the
+    per-star posterior maximum and chi-square minimum, and the second pass
+    accumulates thresholded posterior mass, expectations, PDFs, and optional
+    sparse retained values.
+
+    Full covariance likelihoods and approximate top-k summaries intentionally
+    stay out of this kernel for now.
+    """
+    if backend not in {"numpy", "jax"}:
+        raise ValueError("backend must be either 'numpy' or 'jax'")
+    if model_block_size <= 0:
+        raise ValueError("model_block_size must be positive")
+    if ast_ivar is None:
+        raise ValueError("ast_ivar is required for the diagonal blocked kernel")
+
+    Y_batch = np.asarray(Y_batch, dtype=np.float64, order="C")
+    model_seds_with_bias = np.asarray(
+        model_seds_with_bias, dtype=np.float64, order="C"
+    )
+    ast_ivar = np.asarray(ast_ivar, dtype=np.float64, order="C")
+    log_prior_weights = np.asarray(log_prior_weights, dtype=np.float64)
+    q_param_arrays = np.asarray(q_param_arrays, dtype=np.float64)
+
+    B = Y_batch.shape[0]
+    M = model_seds_with_bias.shape[0]
+    nq = q_param_arrays.shape[0]
+    block_size = min(int(model_block_size), M)
+
+    max_lnp = np.full(B, -np.inf, dtype=np.float64)
+    lnp_local_indices = np.zeros(B, dtype=np.int64)
+    min_chi2 = np.full(B, np.inf, dtype=np.float64)
+    chi2_local_indices = np.zeros(B, dtype=np.int64)
+
+    for m0 in range(0, M, block_size):
+        m1 = min(M, m0 + block_size)
+        lnp0, chi2 = (
+            _batched_diag_loglike_jax(
+                Y_batch, model_seds_with_bias[m0:m1], ast_ivar[m0:m1]
+            )
+            if backend == "jax"
+            else _batched_diag_loglike(
+                Y_batch, model_seds_with_bias[m0:m1], ast_ivar[m0:m1]
+            )
+        )
+        lnp = lnp0 + log_prior_weights[m0:m1][None, :]
+
+        block_lnp_idx = np.argmax(lnp, axis=1)
+        block_lnp = lnp[np.arange(B), block_lnp_idx]
+        update_lnp = block_lnp > max_lnp
+        max_lnp[update_lnp] = block_lnp[update_lnp]
+        lnp_local_indices[update_lnp] = m0 + block_lnp_idx[update_lnp]
+
+        block_chi2_idx = np.argmin(chi2, axis=1)
+        block_chi2 = chi2[np.arange(B), block_chi2_idx]
+        update_chi2 = block_chi2 < min_chi2
+        min_chi2[update_chi2] = block_chi2[update_chi2]
+        chi2_local_indices[update_chi2] = m0 + block_chi2_idx[update_chi2]
+
+    sumw = np.zeros(B, dtype=np.float64)
+    exp_sums = np.zeros((B, nq), dtype=np.float64)
+    p = tuple(p) if compute_percentiles else ()
+    per_vals = np.zeros((B, nq, len(p)), dtype=np.float64)
+
+    pdf1d_batches = [
+        np.zeros((B, len(bin_vals)), dtype=np.float64)
+        for bin_vals in pdf1d_bin_values
+    ]
+    pdf2d_batches = [
+        np.zeros((B, nb1, nb2), dtype=np.float64) for nb1, nb2 in pdf2d_shapes
+    ]
+
+    retained_local_indices = [[] for _ in range(B)]
+    retained_lnp = [[] for _ in range(B)]
+    retained_chi2 = [[] for _ in range(B)]
+
+    for m0 in range(0, M, block_size):
+        m1 = min(M, m0 + block_size)
+        lnp0, chi2 = (
+            _batched_diag_loglike_jax(
+                Y_batch, model_seds_with_bias[m0:m1], ast_ivar[m0:m1]
+            )
+            if backend == "jax"
+            else _batched_diag_loglike(
+                Y_batch, model_seds_with_bias[m0:m1], ast_ivar[m0:m1]
+            )
+        )
+        lnp = lnp0 + log_prior_weights[m0:m1][None, :]
+        keep = (lnp - max_lnp[:, None]) > threshold
+        logw = np.where(keep, lnp - max_lnp[:, None], -np.inf)
+        w = np.exp(np.clip(logw, -700.0, 0.0))
+        sumw += np.sum(w, axis=1)
+
+        for k in range(nq):
+            exp_sums[:, k] += w @ q_param_arrays[k, m0:m1]
+
+        for k, bin_idx in enumerate(pdf1d_bin_indices):
+            pdf1d_batches[k] += _batch_hist1d(bin_idx[m0:m1], w, len(pdf1d_bin_values[k]))
+
+        for k, (flat_idx, shape) in enumerate(zip(pdf2d_flat_indices, pdf2d_shapes)):
+            nb1, nb2 = shape
+            hist_flat = _batch_hist2d(flat_idx[m0:m1], w, nb1 * nb2)
+            pdf2d_batches[k] += hist_flat.reshape(B, nb1, nb2)
+
+        if retain_sparse:
+            for bi in range(B):
+                idx = np.flatnonzero(keep[bi])
+                if idx.size == 0:
+                    continue
+                retained_local_indices[bi].append(m0 + idx)
+                retained_lnp[bi].append(lnp[bi, idx])
+                retained_chi2[bi].append(chi2[bi, idx])
+
+    safe_sumw = np.maximum(sumw, np.finfo(np.float64).tiny)
+    exp_vals = exp_sums / safe_sumw[:, None]
+    for k in range(len(pdf1d_batches)):
+        pdf1d_batches[k] /= safe_sumw[:, None]
+    for k in range(len(pdf2d_batches)):
+        pdf2d_batches[k] /= safe_sumw[:, None, None]
+
+    for k, bin_vals in enumerate(pdf1d_bin_values):
+        if compute_percentiles:
+            per_vals[:, k, :] = _cdf_quantiles_from_pdf(pdf1d_batches[k], bin_vals, p)
+
+    best_vals = q_param_arrays[:, lnp_local_indices].T
+    total_log_norm = max_lnp + np.log(safe_sumw)
+
+    if retain_sparse:
+        retained_local_indices = [
+            np.concatenate(chunks).astype(np.int64) if chunks else np.array([], dtype=np.int64)
+            for chunks in retained_local_indices
+        ]
+        retained_lnp = [
+            np.concatenate(chunks).astype(np.float64) if chunks else np.array([], dtype=np.float64)
+            for chunks in retained_lnp
+        ]
+        retained_chi2 = [
+            np.concatenate(chunks).astype(np.float64) if chunks else np.array([], dtype=np.float64)
+            for chunks in retained_chi2
+        ]
+    else:
+        retained_local_indices = [np.array([], dtype=np.int64) for _ in range(B)]
+        retained_lnp = [np.array([], dtype=np.float64) for _ in range(B)]
+        retained_chi2 = [np.array([], dtype=np.float64) for _ in range(B)]
+
+    return {
+        "lnp": None,
+        "chi2": None,
+        "keep": None,
+        "posterior_weights": None,
+        "weights_used": None,
+        "weight_indices": None,
+        "retained_local_indices": retained_local_indices,
+        "retained_lnp": retained_lnp,
+        "retained_chi2": retained_chi2,
+        "chi2_values": min_chi2,
+        "chi2_local_indices": chi2_local_indices,
+        "lnp_values": max_lnp,
+        "lnp_local_indices": lnp_local_indices,
+        "total_log_norm": total_log_norm,
+        "best_vals": best_vals,
+        "exp_vals": exp_vals,
+        "per_vals": per_vals,
+        "pdf1d_batches": pdf1d_batches,
+        "pdf2d_batches": pdf2d_batches,
+    }
+
+
 def Q_all_memory_batched(
     prev_result,
     obs,
@@ -805,6 +994,7 @@ def Q_all_memory_batched(
     fit_topk_kmin=32,
     fit_topk_kmax=2048,
     fit_topk_kquantile=0.95,
+    fit_model_block_size=0,
     backend="numpy",
     compute_percentiles=True,
 ):
@@ -962,31 +1152,58 @@ def Q_all_memory_batched(
         B = Y.shape[0]
 
         with profile_stage("likelihood computation", detail="batched kernel"):
-            kernel_result = q_all_memory_batched_kernel(
-                Y,
-                mu,
-                g0_weights,
-                q_param_arrays,
-                pdf1d_bin_indices,
-                pdf1d_bin_values,
-                pdf2d_flat_indices=pdf2d_flat_indices,
-                pdf2d_shapes=pdf2d_shapes,
-                ast_ivar=None if full_cov_mat else ast_ivar,
-                ast_q_norm=ast_q_norm if full_cov_mat else None,
-                ast_icov_diag=ast_icov_diag if full_cov_mat else None,
-                two_ast_icov_offdiag=two_ast_icov_offdiag if full_cov_mat else None,
-                use_full_cov_matrix=full_cov_mat,
-                threshold=threshold,
-                p=p,
-                compute_percentiles=compute_percentiles,
-                fit_use_topk=fit_use_topk,
-                fit_topk_mass_target=fit_topk_mass_target,
-                fit_topk_ess_target=fit_topk_ess_target,
-                fit_topk_kmin=fit_topk_kmin,
-                fit_topk_kmax=fit_topk_kmax,
-                fit_topk_kquantile=fit_topk_kquantile,
-                backend=backend,
-            )
+            if fit_model_block_size:
+                if full_cov_mat:
+                    raise NotImplementedError(
+                        "fit_model_block_size is currently implemented only for "
+                        "diagonal likelihoods"
+                    )
+                if fit_use_topk:
+                    raise NotImplementedError(
+                        "fit_model_block_size does not yet support approximate top-k"
+                    )
+                kernel_result = q_all_memory_batched_blocked_kernel(
+                    Y,
+                    mu,
+                    g0_weights,
+                    q_param_arrays,
+                    pdf1d_bin_indices,
+                    pdf1d_bin_values,
+                    pdf2d_flat_indices=pdf2d_flat_indices,
+                    pdf2d_shapes=pdf2d_shapes,
+                    ast_ivar=ast_ivar,
+                    threshold=threshold,
+                    p=p,
+                    compute_percentiles=compute_percentiles,
+                    model_block_size=fit_model_block_size,
+                    backend=backend,
+                )
+            else:
+                kernel_result = q_all_memory_batched_kernel(
+                    Y,
+                    mu,
+                    g0_weights,
+                    q_param_arrays,
+                    pdf1d_bin_indices,
+                    pdf1d_bin_values,
+                    pdf2d_flat_indices=pdf2d_flat_indices,
+                    pdf2d_shapes=pdf2d_shapes,
+                    ast_ivar=None if full_cov_mat else ast_ivar,
+                    ast_q_norm=ast_q_norm if full_cov_mat else None,
+                    ast_icov_diag=ast_icov_diag if full_cov_mat else None,
+                    two_ast_icov_offdiag=two_ast_icov_offdiag if full_cov_mat else None,
+                    use_full_cov_matrix=full_cov_mat,
+                    threshold=threshold,
+                    p=p,
+                    compute_percentiles=compute_percentiles,
+                    fit_use_topk=fit_use_topk,
+                    fit_topk_mass_target=fit_topk_mass_target,
+                    fit_topk_ess_target=fit_topk_ess_target,
+                    fit_topk_kmin=fit_topk_kmin,
+                    fit_topk_kmax=fit_topk_kmax,
+                    fit_topk_kquantile=fit_topk_kquantile,
+                    backend=backend,
+                )
 
         best_local = kernel_result["lnp_local_indices"]
         best_full = g0_indxs[best_local]
@@ -1019,11 +1236,17 @@ def Q_all_memory_batched(
                     idx = idx[:lnp_npts]
 
                 e = b0 + bi
+                if fit_model_block_size:
+                    lnp_save = kernel_result["retained_lnp"][bi][: len(idx)]
+                    chi2_save = kernel_result["retained_chi2"][bi][: len(idx)]
+                else:
+                    lnp_save = kernel_result["lnp"][bi, idx]
+                    chi2_save = kernel_result["chi2"][bi, idx]
                 save_lnp_vals.append([
                     e,
                     np.array(g0_indxs[idx], dtype=np.int64),
-                    np.array(kernel_result["lnp"][bi, idx], dtype=np.float32),
-                    np.array(kernel_result["chi2"][bi, idx], dtype=np.float32),
+                    np.array(lnp_save, dtype=np.float32),
+                    np.array(chi2_save, dtype=np.float32),
                     np.array([Y[bi]]).T,
                 ])
 
@@ -1721,6 +1944,7 @@ def summary_table_memory(
     fit_topk_kmin=32,
     fit_topk_kmax=2048,
     fit_topk_kquantile=0.95,
+    fit_model_block_size=0,
     backend="numpy",
     compute_percentiles=True,
 ):
@@ -1780,6 +2004,10 @@ def summary_table_memory(
         approach.
     backend : {"numpy", "jax"}
         numerical backend for the batched fitting kernel
+    fit_model_block_size : int
+        If positive and ``fit_use_batched`` is true, stream the diagonal
+        likelihood over model blocks of this size instead of materializing the
+        full star-batch by model-grid posterior matrix.
 
     Returns
     -------
@@ -1842,6 +2070,7 @@ def summary_table_memory(
             fit_topk_kmin=fit_topk_kmin,
             fit_topk_kmax=fit_topk_kmax,
             fit_topk_kquantile=fit_topk_kquantile,
+            fit_model_block_size=fit_model_block_size,
             backend=backend,
         )
     else:

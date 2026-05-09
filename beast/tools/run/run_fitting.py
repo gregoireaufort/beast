@@ -31,6 +31,13 @@ def _resolve_fit_bool(settings, explicit_value, setting_name, env_name, default=
     return bool(getattr(settings, setting_name, default))
 
 
+def _resolve_fit_int(settings, setting_name, env_name, default=0):
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return int(env_value)
+    return int(getattr(settings, setting_name, default))
+
+
 def run_fitting(
     beast_settings_info,
     use_sd=True,
@@ -363,6 +370,9 @@ def fit_submodel(
     fit_topk_kmin = getattr(settings, "fit_topk_kmin", 32)
     fit_topk_kmax = getattr(settings, "fit_topk_kmax", 2048)
     fit_topk_kquantile = getattr(settings, "fit_topk_kquantile", 0.95)
+    fit_model_block_size = _resolve_fit_int(
+        settings, "fit_model_block_size", "BEAST_FIT_MODEL_BLOCK_SIZE", 0
+    )
     fit_compute_percentiles = getattr(settings, "fit_compute_percentiles", True)
 
     if subgrid_run:
@@ -391,6 +401,7 @@ def fit_submodel(
             fit_topk_kmin=fit_topk_kmin,
             fit_topk_kmax=fit_topk_kmax,
             fit_topk_kquantile=fit_topk_kquantile,
+            fit_model_block_size=fit_model_block_size,
             compute_percentiles=fit_compute_percentiles,
         )
         print("Done fitting on grid " + modelsedgrid_file)
@@ -420,6 +431,7 @@ def fit_submodel(
             fit_topk_kmin=fit_topk_kmin,
             fit_topk_kmax=fit_topk_kmax,
             fit_topk_kquantile=fit_topk_kquantile,
+            fit_model_block_size=fit_model_block_size,
             compute_percentiles=fit_compute_percentiles,
         )
         print("Done fitting on grid " + modelsedgrid_file)

@@ -6,6 +6,7 @@ from astropy.table import Table
 from beast.fitting.fit import (
     Q_all_memory,
     Q_all_memory_batched,
+    q_all_memory_batched_blocked_kernel,
     q_all_memory_batched_kernel,
 )
 from beast.physicsmodel.grid import SEDGrid
@@ -182,6 +183,49 @@ def test_q_all_memory_batched_matches_original_stats(tmp_path):
     batched_pdf.close()
 
 
+def test_q_all_memory_batched_blocked_matches_original_stats(tmp_path):
+    original, original_pdf = _run_original(tmp_path / "original")
+    blocked, blocked_pdf = _run_batched(
+        tmp_path / "blocked",
+        fit_model_block_size=2,
+    )
+
+    float_cols = [
+        "chi2min",
+        "Pmax",
+        "M_ini_Exp",
+        "Av_Exp",
+        "M_ini_p16",
+        "M_ini_p50",
+        "M_ini_p84",
+        "Av_p16",
+        "Av_p50",
+        "Av_p84",
+    ]
+    for col in float_cols:
+        np.testing.assert_allclose(blocked[col], original[col], rtol=1e-12, atol=1e-12)
+
+    for col in ["Pmax_indx", "chi2min_indx", "specgrid_indx"]:
+        np.testing.assert_array_equal(blocked[col], original[col])
+
+    for extname in ["M_ini", "Av"]:
+        np.testing.assert_allclose(
+            blocked_pdf[extname].data[:-2],
+            original_pdf[extname].data[:-1],
+            rtol=1e-7,
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            blocked_pdf[extname].data[-1],
+            original_pdf[extname].data[-1],
+            rtol=0.0,
+            atol=1e-7,
+        )
+
+    original_pdf.close()
+    blocked_pdf.close()
+
+
 def test_q_all_memory_stats_only_skips_pdf_percentiles_and_lnp(tmp_path):
     full_stats, full_pdf = _run_original(tmp_path / "full")
     prev_result, obs, sedgrid, noisemodel = _tiny_fit_inputs()
@@ -334,6 +378,129 @@ def test_q_all_memory_batched_kernel_jax_matches_numpy():
         jax_result["pdf1d_batches"], numpy_result["pdf1d_batches"]
     ):
         np.testing.assert_allclose(jax_pdf, numpy_pdf, rtol=1e-12, atol=1e-12)
+
+
+def test_q_all_memory_batched_blocked_kernel_matches_dense_kernel():
+    _, obs, sedgrid, noisemodel = _tiny_fit_inputs()
+    Y_batch = np.vstack([obj for _, obj in obs.enumobs()])
+    model_seds_with_bias = sedgrid.seds + noisemodel["bias"]
+    log_prior_weights = np.log(np.asarray(sedgrid["weight"]))
+    ast_ivar = 1.0 / noisemodel["error"] ** 2
+    q_param_arrays = np.vstack([np.asarray(sedgrid["M_ini"]), np.asarray(sedgrid["Av"])])
+    pdf1d_bin_values = [q_param_arrays[0], q_param_arrays[1]]
+    pdf1d_bin_indices = [
+        np.searchsorted(pdf1d_bin_values[0], q_param_arrays[0], side="left"),
+        np.searchsorted(pdf1d_bin_values[1], q_param_arrays[1], side="left"),
+    ]
+    flat_idx = pdf1d_bin_indices[0] * len(pdf1d_bin_values[1]) + pdf1d_bin_indices[1]
+
+    common_kwargs = dict(
+        Y_batch=Y_batch,
+        model_seds_with_bias=model_seds_with_bias,
+        log_prior_weights=log_prior_weights,
+        q_param_arrays=q_param_arrays,
+        pdf1d_bin_indices=pdf1d_bin_indices,
+        pdf1d_bin_values=pdf1d_bin_values,
+        pdf2d_flat_indices=[flat_idx],
+        pdf2d_shapes=[(len(pdf1d_bin_values[0]), len(pdf1d_bin_values[1]))],
+        ast_ivar=ast_ivar,
+        threshold=-40.0,
+        p=(16.0, 50.0, 84.0),
+        compute_percentiles=True,
+    )
+
+    dense = q_all_memory_batched_kernel(**common_kwargs, backend="numpy")
+    blocked = q_all_memory_batched_blocked_kernel(
+        **common_kwargs,
+        backend="numpy",
+        model_block_size=2,
+    )
+
+    for key in [
+        "chi2_values",
+        "lnp_values",
+        "total_log_norm",
+        "best_vals",
+        "exp_vals",
+        "per_vals",
+    ]:
+        np.testing.assert_allclose(
+            blocked[key],
+            dense[key],
+            rtol=1e-12,
+            atol=1e-12,
+            err_msg=f"{key} differs between dense and blocked kernels",
+        )
+
+    for key in ["chi2_local_indices", "lnp_local_indices"]:
+        np.testing.assert_array_equal(blocked[key], dense[key])
+
+    for blocked_pdf, dense_pdf in zip(blocked["pdf1d_batches"], dense["pdf1d_batches"]):
+        np.testing.assert_allclose(blocked_pdf, dense_pdf, rtol=1e-12, atol=1e-12)
+
+    for blocked_pdf, dense_pdf in zip(blocked["pdf2d_batches"], dense["pdf2d_batches"]):
+        np.testing.assert_allclose(blocked_pdf, dense_pdf, rtol=1e-12, atol=1e-12)
+
+    for bi, idx in enumerate(blocked["retained_local_indices"]):
+        np.testing.assert_array_equal(idx, dense["retained_local_indices"][bi])
+        np.testing.assert_allclose(
+            blocked["retained_lnp"][bi],
+            dense["lnp"][bi, idx],
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            blocked["retained_chi2"][bi],
+            dense["chi2"][bi, idx],
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+
+def test_q_all_memory_batched_blocked_kernel_jax_matches_numpy():
+    pytest.importorskip("jax")
+
+    _, obs, sedgrid, noisemodel = _tiny_fit_inputs()
+    Y_batch = np.vstack([obj for _, obj in obs.enumobs()])
+    model_seds_with_bias = sedgrid.seds + noisemodel["bias"]
+    log_prior_weights = np.log(np.asarray(sedgrid["weight"]))
+    ast_ivar = 1.0 / noisemodel["error"] ** 2
+    q_param_arrays = np.vstack([np.asarray(sedgrid["M_ini"]), np.asarray(sedgrid["Av"])])
+    pdf1d_bin_values = [q_param_arrays[0], q_param_arrays[1]]
+    pdf1d_bin_indices = [
+        np.searchsorted(pdf1d_bin_values[0], q_param_arrays[0], side="left"),
+        np.searchsorted(pdf1d_bin_values[1], q_param_arrays[1], side="left"),
+    ]
+
+    common_kwargs = dict(
+        Y_batch=Y_batch,
+        model_seds_with_bias=model_seds_with_bias,
+        log_prior_weights=log_prior_weights,
+        q_param_arrays=q_param_arrays,
+        pdf1d_bin_indices=pdf1d_bin_indices,
+        pdf1d_bin_values=pdf1d_bin_values,
+        ast_ivar=ast_ivar,
+        threshold=-40.0,
+        p=(16.0, 50.0, 84.0),
+        compute_percentiles=True,
+        model_block_size=2,
+    )
+
+    numpy_result = q_all_memory_batched_blocked_kernel(**common_kwargs, backend="numpy")
+    jax_result = q_all_memory_batched_blocked_kernel(**common_kwargs, backend="jax")
+
+    for key in [
+        "chi2_values",
+        "lnp_values",
+        "total_log_norm",
+        "best_vals",
+        "exp_vals",
+        "per_vals",
+    ]:
+        np.testing.assert_allclose(jax_result[key], numpy_result[key], rtol=1e-12, atol=1e-12)
+
+    for key in ["chi2_local_indices", "lnp_local_indices"]:
+        np.testing.assert_array_equal(jax_result[key], numpy_result[key])
 
 
 def test_q_all_memory_batched_topk_mass_invariant(tmp_path):
