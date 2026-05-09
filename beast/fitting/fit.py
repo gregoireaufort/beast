@@ -1013,7 +1013,7 @@ def Q_all_memory_batched(
     g0_indxs = np.where(g0_w > 0.0)[0]
     g0_weights = np.log(g0_w[g0_indxs])
     if not do_not_normalize:
-        g0_weights -= np.max(g0_weights)
+        g0_weights -= np.log(g0_w[g0_indxs].sum())
 
     mu = model_seds_with_bias[g0_indxs]
     qnames = list(qnames_in)
@@ -1177,6 +1177,7 @@ def Q_all_memory_batched(
                     compute_percentiles=compute_percentiles,
                     model_block_size=fit_model_block_size,
                     backend=backend,
+                    retain_sparse=lnp_outname is not None,
                 )
             else:
                 kernel_result = q_all_memory_batched_kernel(

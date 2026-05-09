@@ -226,6 +226,52 @@ def test_q_all_memory_batched_blocked_matches_original_stats(tmp_path):
     blocked_pdf.close()
 
 
+def test_q_all_memory_batched_matches_original_with_normalized_prior(tmp_path):
+    prev_result, obs, sedgrid, noisemodel = _tiny_fit_inputs()
+    original_stats = tmp_path / "original_norm_stats.fits"
+    batched_stats = tmp_path / "blocked_norm_stats.fits"
+
+    Q_all_memory(
+        prev_result,
+        obs,
+        sedgrid,
+        noisemodel,
+        ["M_ini", "Av"],
+        threshold=-40.0,
+        max_nbins=10,
+        stats_outname=str(original_stats),
+        pdf1d_outname=None,
+        use_full_cov_matrix=False,
+        do_not_normalize=False,
+        compute_percentiles=False,
+    )
+
+    Q_all_memory_batched(
+        prev_result,
+        obs,
+        sedgrid,
+        noisemodel,
+        ["M_ini", "Av"],
+        threshold=-40.0,
+        max_nbins=10,
+        stats_outname=str(batched_stats),
+        pdf1d_outname=None,
+        use_full_cov_matrix=False,
+        do_not_normalize=False,
+        compute_percentiles=False,
+        fit_star_batch_size=2,
+        fit_model_block_size=2,
+    )
+
+    original = Table.read(original_stats, hdu=1)
+    batched = Table.read(batched_stats, hdu=1)
+
+    for col in ["chi2min", "Pmax", "M_ini_Exp", "Av_Exp"]:
+        np.testing.assert_allclose(batched[col], original[col], rtol=1e-12, atol=1e-12)
+    for col in ["Pmax_indx", "chi2min_indx", "specgrid_indx"]:
+        np.testing.assert_array_equal(batched[col], original[col])
+
+
 def test_q_all_memory_stats_only_skips_pdf_percentiles_and_lnp(tmp_path):
     full_stats, full_pdf = _run_original(tmp_path / "full")
     prev_result, obs, sedgrid, noisemodel = _tiny_fit_inputs()
